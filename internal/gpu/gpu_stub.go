@@ -21,14 +21,12 @@ var ErrUnavailable = errors.New("CUDA backend unavailable: rebuild with CGO_ENAB
 
 // Buffer is an opaque device allocation placeholder for stub builds.
 type Buffer struct {
-	bytes  int
+	bytes int
+	// device stays 0 on stub builds: there is no device to bind to, and the
+	// shared bounds checks still compare it to catch mixed-device callers.
 	device int
 	freed  bool
 }
-
-// currentDevice reports the device new allocations land on. Stub builds have
-// no device; buffers record device 0 so mixed-device validation still runs.
-func currentDevice() int { return 0 }
 
 func alloc(bytes int, what string) (*Buffer, error) {
 	if bytes < 0 {
