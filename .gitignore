@@ -14,6 +14,9 @@ coverage.txt
 .m3tal-review/
 models/
 
+# Generated evaluation reports (refer to models/, which is not tracked)
+reports/
+
 # Built token datasets (large binary shards)
 data/tinystories-ds/
 
