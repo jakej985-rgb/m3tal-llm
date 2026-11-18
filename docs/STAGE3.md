@@ -55,16 +55,36 @@ Committed data:
 
 `Model.TrainChat` trains on masked chat windows using the shared
 `TrainConfig` schedule (warmup + cosine decay + grad clip + seeded
-sampling). `PrepareChatExamples` truncates over-long conversations from
-the front (most recent turns kept) and drops windows with no assistant
-tokens. `SFTMetrics` logs step, loss, LR, tok/s, grad norm, and cumulative
-masked-token counts. Optimizer state and step count persist through
+sampling). `PrepareChatExamples` builds conversation-safe windows
+(`internal/lm/windows.go`): a message is atomic, so a window always begins
+at a message header and no assistant target is ever partially included.
+Leading system messages and the final request plus its reply are the
+protected spine; earlier history is dropped as whole messages, newest
+first. An example whose spine does not fit is dropped and counted, never
+cut. `SFTMetrics` logs step, loss, LR, tok/s, grad norm, and cumulative
+masked-token counts; `SummarizeSFT` and the CLI report retained, dropped
+(by reason), and trimmed counts. Optimizer state and step count persist through
 `SaveCheckpoint`/`LoadCheckpoint`, so `--max-steps` is an absolute target
 and SFT resumes exactly like pretraining. The base checkpoint is never
 modified — SFT writes a new checkpoint.
 
 CLI: `train --base-model CKPT --sft train.jsonl --checkpoint out.json
 --max-steps N --learning-rate LR ...`
+
+Truncation policy (shared by SFT and DPO, `internal/lm/windows.go`):
+
+- Messages are the atomic unit; no window starts mid-message and no
+  assistant target is split.
+- Protected: leading system messages, the last non-assistant message (the
+  active request), and the assistant replies after it. Leftover budget is
+  filled with whole earlier messages, newest first.
+- An example whose protected spine exceeds the context is dropped and
+  counted by reason (`oversized_system_prompt`, `oversized_user_request`,
+  `oversized_assistant_target`, `no_assistant_tokens`, `too_short`).
+- DPO trims one shared prompt against the longer of the two replies, so
+  chosen and rejected are always scored under identical context; a pair
+  with no room left for that prompt is dropped instead of compared
+  asymmetrically.
 
 ## Decoding (`internal/lm/sample.go`)
 

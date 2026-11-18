@@ -33,7 +33,8 @@ softmax cross-entropy. Available activations include tanh and ReLU.
 
 `internal/lm` contains a small pure-Go byte-level BPE tokenizer and a causal
 transformer with RMSNorm and RoPE position encoding. It trains from UTF-8 text
-and saves local JSON checkpoints; it does not download weights or call a model
+and saves local checkpoints — JSON for small models, safetensors for large ones
+(`LoadCheckpoint` reads both); it does not download weights or call a model
 service. This is an educational prototype and is not a production-quality
 general language model. Training uses explicit backpropagation on the same
 contiguous `float32` CPU weights as generation and evaluation. Byte-level

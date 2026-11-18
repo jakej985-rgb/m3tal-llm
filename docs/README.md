@@ -29,7 +29,8 @@ see `ECOSYSTEM_INTEGRATION.md`.
      JSONL validation/splitting.
 3. **Training** — covered by the architecture docs above plus
    `EXPERIMENTS.md` (train flags live in `cmd/m3tal-lm`; `--dataset`,
-   `--sft`, `--dpo`, `--max-steps` semantics).
+   `--sft`, `--dpo`, `--max-steps` semantics) and `CHECKPOINTS.md`
+   (integrity checks, atomic saves, evaluation identity).
 4. **Evaluation** — `EVAL.md` (`eval-bench`, `--eval-mode`, baseline
    regression) and the chat-eval section of `STAGE3.md`.
 5. **Serving** — `SERVE.md` (`m3tal-lm serve` HTTP API, safety policy,
@@ -52,6 +53,7 @@ see `ECOSYSTEM_INTEGRATION.md`.
 | `RUN-stage2.md` | Recorded Stage 2 training run |
 | `DATA.md` | Dataset build/verify/provenance pipeline |
 | `EVAL.md` | `eval-bench` repeatable evaluation |
+| `CHECKPOINTS.md` | Checkpoint integrity, durability, eval identity, legacy import |
 | `SERVE.md` | HTTP inference server + Go client |
 | `PACKAGING.md` | Model cards, bundles, hardware needs |
 | `CUDA.md` | Optional CUDA backend (build tag `cuda`) |

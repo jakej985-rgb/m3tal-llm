@@ -34,11 +34,32 @@ m3tal-lm eval-bench \
 - **Backend** — records `kernel.Selected()` so CPU vs CUDA results are
   attributable.
 
+## Evaluation identity
+
+Every report carries an `identity` object binding the numbers to what was
+measured: `evaluator_version`, `eval_mode`, `backend`, `checkpoint_sha256`,
+`model_sha256`, `tokenizer_hash`, `model_config`/`context`, `dataset_sha256`
+(of the corpus files, or of the in-memory suite for chat-eval),
+`dataset_split`/`dataset_items`/`dataset_tokens` (the corpus size before any
+`--max-eval-tokens` cap), and `eval_tokens`. `docs/CHECKPOINTS.md` documents
+the exact rules.
+
+`--baseline` (and `chat-eval --baseline`) uses it:
+
+- **Refuses** an incomparable baseline with a non-zero exit and the list of
+differences — evaluator version, eval mode, context, model config, tokenizer,
+dataset fingerprint, or scored token count.
+- **Warns** when the comparison is possible but noisy: a different backend
+  (CPU and CUDA reduce in a different order), a different split name, a
+  baseline evaluated on the same checkpoint, or a baseline report that
+  predates identity recording.
+
 ## Baseline and regression
 
 `--baseline REPORT.json` compares `eval_loss` against a previous
-`eval-bench` report; the command exits non-zero when the increase exceeds
-`--max-loss-increase` (default 0.05 nats). Reports are plain JSON —
+`eval-bench` report, but only after the identity check above accepts the pair;
+the command exits non-zero when the increase exceeds `--max-loss-increase`
+(default 0.05 nats). Reports are plain JSON —
 checkpoint, backend, corpus path, eval token count, per-prompt
 prompt/output pairs, and timestamp — so they can be diffed and archived.
 

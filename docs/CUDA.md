@@ -67,6 +67,37 @@ Detection uses the CUDA runtime API (`cudaGetDeviceCount`,
 `cudaGetDeviceProperties`), so it reflects what the *runtime* can actually
 use, not just what `nvidia-smi` shows.
 
+## Boundary validation
+
+Every public operation in `internal/gpu` validates its arguments before any
+device call, so bad input can never reach a kernel:
+
+- nil, freed and empty buffers are rejected with an error wrapping
+  `gpu.ErrInvalid`; only genuine empty-input no-ops (`Upload(nil)` into an
+  empty buffer, a zero-length D2D copy, an empty-shape host matmul) return
+  nil.
+- Offsets, lengths and dimensions are checked for negative values, integer
+  overflow, and fit against the actual allocation size.
+- Shapes are validated together (`M*K`/`K*N`/`M*N` for GEMM,
+  `heads*headDim == width` for attention and RoPE, `rows*width` row counts,
+  whole-row embedding tables), so a wrong dimension errors instead of
+  reading past a buffer.
+- Host→device and device→host copies must fill the buffer exactly, so a
+  short slice cannot leave device memory stale or uninitialized.
+- Device-to-device copies reject out-of-range spans and overlapping ranges
+  within one buffer (`cudaMemcpy` is undefined for those).
+- Buffers record the device they were allocated on; any operation mixing
+  devices is rejected.
+- The CUDA inference backend additionally rejects KV steps whose position is
+  outside `[0, Context)` or disagrees with the host K/V mirror, serving them
+  from the CPU reference path instead.
+
+The checks live in `internal/gpu/bounds.go`, which is compiled into both the
+CUDA and non-CUDA builds, so callers see identical input errors either way.
+`internal/gpu/bounds_test.go` exercises the validation tables on any machine;
+`bounds_gpu_test.go` covers device-backed behaviour and skips cleanly when no
+device is present.
+
 ## Testing without a GPU
 
 CI runners have no GPU and no toolkit. All CUDA code sits behind the `cuda`
