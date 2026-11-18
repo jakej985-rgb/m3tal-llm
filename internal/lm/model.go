@@ -1,15 +1,19 @@
 package lm
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"os"
-	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"unsafe"
 )
 
 // Config defines the multi-layer, multi-head decoder-only Transformer.
@@ -101,7 +105,12 @@ type Model struct {
 	parameters []*parameter
 	step       int64
 	seed       int64
-	backend    inferenceBackend
+
+	// backend is the cached inference snapshot. It is built lazily and may
+	// be requested by several HTTP handlers at once, so access is guarded
+	// by backendMu. Training invalidates it via invalidateBackend.
+	backendMu sync.Mutex
+	backend   inferenceBackend
 }
 
 // ParameterCount reports the number of trainable scalar weights.
@@ -131,16 +140,14 @@ func (m *Model) addParameter(p *parameter) *parameter {
 // Every transformer block now carries two RMSNorm gamma vectors (pre-attention
 // and pre-FFN). Position is encoded via RoPE; no posEmb table is allocated.
 func NewModel(config Config, tokenizer *Tokenizer, seed int64) (*Model, error) {
+	// Validate before defaulting so a negative layers/heads value in a
+	// checkpoint is rejected instead of silently becoming the default.
+	if err := config.Validate(); err != nil {
+		return nil, err
+	}
 	config.Normalize()
-	if config.Context < 2 || config.Context > 2048 || config.Width < 2 || config.Width > 2048 ||
-		tokenizer == nil || len(tokenizer.Tokens) < MinVocabSize || len(tokenizer.Tokens) > MaxVocabSize {
-		return nil, fmt.Errorf("invalid model config or tokenizer")
-	}
-	if config.Layers < 1 || config.Layers > 16 {
-		return nil, fmt.Errorf("layers must be between 1 and 16")
-	}
-	if config.Heads < 1 || config.Heads > 32 || config.Width%config.Heads != 0 {
-		return nil, fmt.Errorf("width %d must be divisible by heads %d", config.Width, config.Heads)
+	if err := tokenizer.Validate(); err != nil {
+		return nil, err
 	}
 	rng := rand.New(rand.NewSource(seed))
 	m := &Model{Config: config, Tokenizer: tokenizer, seed: seed}
@@ -592,7 +599,7 @@ func (m *Model) Train(texts []string, epochs, stepsPerEpoch int, learningRate fl
 	if epochs <= 0 || stepsPerEpoch <= 0 || learningRate <= 0 || math.IsNaN(learningRate) || math.IsInf(learningRate, 0) {
 		return nil, fmt.Errorf("epochs, steps, and finite positive learning rate are required")
 	}
-	m.backend = nil
+	m.invalidateBackend()
 	var ids []int
 	for _, text := range texts {
 		ids = append(ids, m.Tokenizer.Encode(text)...)
@@ -636,7 +643,7 @@ func (m *Model) TrainInstructions(examples []InstructionExample, epochs, stepsPe
 	if len(examples) == 0 {
 		return nil, fmt.Errorf("instruction examples required")
 	}
-	m.backend = nil
+	m.invalidateBackend()
 
 	type preparedExample struct {
 		input   []int
@@ -765,10 +772,20 @@ func (m *Model) Evaluate(texts []string) (float64, error) {
 }
 
 func (m *Model) inferenceBackend() inferenceBackend {
+	m.backendMu.Lock()
+	defer m.backendMu.Unlock()
 	if m.backend == nil {
 		m.backend = newInferenceBackend(m)
 	}
 	return m.backend
+}
+
+// invalidateBackend drops the cached inference snapshot after training has
+// changed the weights. Generators already holding a snapshot keep using it.
+func (m *Model) invalidateBackend() {
+	m.backendMu.Lock()
+	m.backend = nil
+	m.backendMu.Unlock()
 }
 
 func validUTF8Append(prefix []byte, suffix string) bool {
@@ -828,75 +845,469 @@ func appendString(prefix []byte, suffix string) []byte {
 	return prefix
 }
 
-// checkpoint is the on-disk format. All learnable parameters are stored as a
-// flat float64 slice in the same order that NewModel allocates them.
+// checkpointHeader is the JSON container (format_version 2). All learnable
+// parameters are stored as a flat array in the same order that NewModel
+// allocates them. Large models are written as safetensors instead; see
+// SaveCheckpoint.
 // FormatVersion 2 adds training metadata (step, seed, tokenizer fingerprint)
 // and optional Adam optimizer state so interrupted runs can resume.
-type checkpoint struct {
+type checkpointHeader struct {
 	FormatVersion int               `json:"format_version,omitempty"`
 	Config        Config            `json:"config"`
 	Tokens        [][]byte          `json:"tokens"`
 	Merges        []checkpointMerge `json:"merges"`
-	Values        []float64         `json:"values"`
 	Step          int64             `json:"step,omitempty"`
 	Seed          int64             `json:"seed,omitempty"`
 	TokenizerHash string            `json:"tokenizer_hash,omitempty"`
-	Optimizer     *optimizerState   `json:"optimizer,omitempty"`
+	SpecialTokens map[string]int    `json:"special_tokens,omitempty"`
+	Values        json.RawMessage   `json:"values"`
+	Optimizer     *optimizerRaw     `json:"optimizer,omitempty"`
 }
 
-// optimizerState stores Adam first/second moments aligned with Values order.
-type optimizerState struct {
-	First  []float64 `json:"first"`
-	Second []float64 `json:"second"`
+type optimizerRaw struct {
+	First  json.RawMessage `json:"first"`
+	Second json.RawMessage `json:"second"`
 }
 
 type checkpointMerge struct{ Left, Right, Token []byte }
 
-// SaveCheckpoint writes tokenizer, weights, and training state (optimizer
-// moments, step count, seed) to a local JSON checkpoint. The format is
-// backward compatible: older readers ignore the added fields, and older
-// checkpoints load with zeroed optimizer state.
-func (m *Model) SaveCheckpoint(path string) error {
-	state := checkpoint{
-		FormatVersion: 2,
-		Config:        m.Config,
-		Step:          m.step,
-		Seed:          m.seed,
-		TokenizerHash: TokenizerFingerprint(m.Tokenizer),
-		Tokens:        make([][]byte, len(m.Tokenizer.Tokens)),
-		Merges:        make([]checkpointMerge, len(m.Tokenizer.Merges)),
+// checkpointTokenizer is the tokenizer part of a checkpoint, shared by the JSON
+// and safetensors containers.
+type checkpointTokenizer struct {
+	Tokens        [][]byte          `json:"tokens"`
+	Merges        []checkpointMerge `json:"merges"`
+	SpecialTokens map[string]int    `json:"special_tokens,omitempty"`
+}
+
+// tokenizerFromCheckpoint rebuilds a tokenizer and restores the well-known
+// special tokens when they are not listed explicitly.
+func tokenizerFromCheckpoint(tokens [][]byte, merges []checkpointMerge, special map[string]int) *Tokenizer {
+	tokenizer := &Tokenizer{
+		Tokens:        make([]string, len(tokens)),
+		Merges:        make([]Merge, len(merges)),
+		SpecialTokens: make(map[string]int, len(special)),
 	}
-	for i, token := range m.Tokenizer.Tokens {
-		state.Tokens[i] = []byte(token)
+	for k, v := range special {
+		tokenizer.SpecialTokens[k] = v
 	}
-	for i, merge := range m.Tokenizer.Merges {
-		state.Merges[i] = checkpointMerge{[]byte(merge.Left), []byte(merge.Right), []byte(merge.Token)}
-	}
-	for _, p := range m.parameters {
-		for _, v := range p.values {
-			state.Values = append(state.Values, float64(v))
+	for i, token := range tokens {
+		tokenizer.Tokens[i] = string(token)
+		switch tokenizer.Tokens[i] {
+		case "<|endoftext|>", "<|im_end|>", "<|im_start|>", "<|pad|>", "<|unk|>":
+			if _, ok := tokenizer.SpecialTokens[tokenizer.Tokens[i]]; !ok {
+				tokenizer.SpecialTokens[tokenizer.Tokens[i]] = i
+			}
 		}
 	}
-	opt := &optimizerState{First: make([]float64, 0, len(state.Values)), Second: make([]float64, 0, len(state.Values))}
-	for _, p := range m.parameters {
-		for i := range p.values {
-			opt.First = append(opt.First, float64(p.first[i]))
-			opt.Second = append(opt.Second, float64(p.second[i]))
-		}
+	for i, merge := range merges {
+		tokenizer.Merges[i] = Merge{Left: string(merge.Left), Right: string(merge.Right), Token: string(merge.Token)}
 	}
-	state.Optimizer = opt
-	data, err := json.Marshal(state)
+	tokenizer.reindex()
+	return tokenizer
+}
+
+// parseFloatSliceInto decodes a JSON array of numbers into target, which must
+// have exactly one slot per number. Each value has a fixed index, so splitting
+// the work across cores cannot change the result.
+func parseFloatSliceInto(raw []byte, target []float32) error {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) < 2 || raw[0] != '[' || raw[len(raw)-1] != ']' {
+		return fmt.Errorf("invalid json float array")
+	}
+	body := raw[1 : len(raw)-1]
+	if workers := runtime.GOMAXPROCS(0); workers > 1 && len(target) >= 1<<15 {
+		if ok, err := parseFloatsParallel(body, target, workers); ok {
+			return err
+		}
+		// Chunk element counts did not line up; fall through so the serial
+		// parser reports the mismatch.
+	}
+	n, err := parseFloats(body, target)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if n != len(target) {
+		return fmt.Errorf("checkpoint has %d parameters; model requires %d", n, len(target))
+	}
+	return nil
+}
+
+// parseFloatsParallel cuts body at comma boundaries and parses the chunks
+// concurrently into disjoint slices of target. ok is false when the array does
+// not hold exactly len(target) numbers, leaving the report to the serial path.
+func parseFloatsParallel(body []byte, target []float32, workers int) (ok bool, err error) {
+	type chunk struct {
+		start, end int
+		count      int
+		offset     int
+	}
+	chunks := make([]chunk, 0, workers)
+	pos, total := 0, 0
+	for pos < len(body) && len(chunks) < workers {
+		n := chunk{start: pos, end: len(body)}
+		if len(chunks) < workers-1 {
+			boundary := len(body) * (len(chunks) + 1) / workers
+			if boundary < n.start {
+				boundary = n.start
+			}
+			if comma := bytes.IndexByte(body[boundary:], ','); comma >= 0 {
+				n.end = boundary + comma + 1
+			}
+		}
+		// Interior chunks end just after a comma, so they hold exactly one
+		// number per comma; only the final chunk holds a trailing number.
+		n.count = bytes.Count(body[n.start:n.end], []byte(","))
+		if n.end == len(body) {
+			n.count++
+		}
+		n.offset = total
+		total += n.count
+		chunks = append(chunks, n)
+		pos = n.end
+	}
+	if total != len(target) {
+		return false, nil
+	}
+	errs := make([]error, len(chunks))
+	var wg sync.WaitGroup
+	for i, c := range chunks {
+		wg.Add(1)
+		go func(i int, c chunk) {
+			defer wg.Done()
+			parsed, err := parseFloats(body[c.start:c.end], target[c.offset:c.offset+c.count])
+			if err != nil {
+				errs[i] = err
+			} else if parsed != c.count {
+				errs[i] = fmt.Errorf("invalid json float array")
+			}
+		}(i, c)
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return true, err
+		}
+	}
+	return true, nil
+}
+
+// parseFloats parses a comma-separated run of JSON numbers into target and
+// reports how many it read.
+func parseFloats(body []byte, target []float32) (int, error) {
+	n := 0
+	for i := 0; i < len(body); {
+		for i < len(body) && isJSONSeparator(body[i]) {
+			i++
+		}
+		if i >= len(body) {
+			break
+		}
+		start := i
+		for i < len(body) && !isJSONSeparator(body[i]) {
+			i++
+		}
+		if n >= len(target) {
+			return n, fmt.Errorf("checkpoint has extra parameters beyond model capacity %d", len(target))
+		}
+		value := unsafe.String(&body[start], i-start)
+		v, err := strconv.ParseFloat(value, 32)
+		if err != nil {
+			return n, fmt.Errorf("parse float %q: %w", value, err)
+		}
+		target[n] = float32(v)
+		n++
+	}
+	return n, nil
+}
+
+func isJSONSeparator(b byte) bool {
+	return b == ',' || b == ' ' || b == '\t' || b == '\n' || b == '\r'
+}
+
+func skipJSONSpace(data []byte, i int) int {
+	for i < len(data) {
+		switch data[i] {
+		case ' ', '\t', '\n', '\r':
+			i++
+		default:
+			return i
+		}
+	}
+	return i
+}
+
+// keyAt returns the offsets of a JSON object key and its value. A token whose
+// text equals key never matches, because token strings are followed by a comma
+// or a closing bracket rather than a colon.
+func keyAt(data []byte, from int, key string) (keyStart, valueStart int, ok bool) {
+	needle := []byte(`"` + key + `"`)
+	for search := from; search < len(data); {
+		idx := bytes.Index(data[search:], needle)
+		if idx < 0 {
+			return 0, 0, false
+		}
+		found := search + idx
+		value := skipJSONSpace(data, found+len(needle))
+		if value < len(data) && data[value] == ':' {
+			return found, skipJSONSpace(data, value+1), true
+		}
+		search = found + 1
+	}
+	return 0, 0, false
+}
+
+// arrayAfterKey returns the byte range of the array value for key. Occurrences
+// whose value is not an array (for example a special token that happens to be
+// named after the key) are skipped.
+func arrayAfterKey(data []byte, from int, key string) (keyStart, start, end int, ok bool) {
+	for from < len(data) {
+		found, value, matched := keyAt(data, from, key)
+		if !matched {
+			return 0, 0, 0, false
+		}
+		if value < len(data) && data[value] == '[' {
+			closing := bytes.IndexByte(data[value:], ']')
+			if closing < 0 {
+				return 0, 0, 0, false
+			}
+			return found, value, value + closing + 1, true
+		}
+		from = found + 1
+	}
+	return 0, 0, 0, false
+}
+
+// checkpointArrays holds a checkpoint's header and the raw numeric arrays, so
+// weights can be parsed without routing them through encoding/json.
+type checkpointArrays struct {
+	header       checkpointHeader
+	values       []byte
+	first        []byte
+	second       []byte
+	hasOptimizer bool
+}
+
+// optimizerArrays returns the Adam moment arrays when the checkpoint carries an
+// optimizer object. A present but malformed optimizer is an error, matching the
+// strict whole-document decoding path.
+func optimizerArrays(data []byte) (first, second []byte, present bool, err error) {
+	_, value, ok := keyAt(data, 0, "optimizer")
+	if !ok {
+		return nil, nil, false, nil
+	}
+	// Scope the search to the optimizer object, whose only members are the two
+	// number arrays, so a token or special-token key named "first" or "second"
+	// elsewhere in the file cannot be mistaken for optimizer state.
+	end := bytes.IndexByte(data[value:], '}')
+	if end < 0 {
+		return nil, nil, true, fmt.Errorf("invalid json float array")
+	}
+	region := data[value : value+end]
+	_, firstStart, firstEnd, firstOK := arrayAfterKey(region, 0, "first")
+	_, secondStart, secondEnd, secondOK := arrayAfterKey(region, 0, "second")
+	if !firstOK || !secondOK {
+		return nil, nil, true, fmt.Errorf("invalid json float array")
+	}
+	return region[firstStart:firstEnd], region[secondStart:secondEnd], true, nil
+}
+
+// decodeCheckpoint extracts the header and numeric arrays, preferring a layout
+// aware path and falling back to decoding the whole document, so every
+// checkpoint that loaded before still loads.
+func decodeCheckpoint(data []byte) (checkpointArrays, error) {
+	var out checkpointArrays
+	if keyStart, start, end, found := arrayAfterKey(data, 0, "values"); found {
+		headerJSON := make([]byte, 0, keyStart+1)
+		headerJSON = append(headerJSON, bytes.TrimRight(data[:keyStart], " \t\r\n,")...)
+		headerJSON = append(headerJSON, '}')
+		if err := json.Unmarshal(headerJSON, &out.header); err == nil && len(out.header.Tokens) > 0 {
+			first, second, hasOptimizer, err := optimizerArrays(data)
+			if err != nil {
+				return out, fmt.Errorf("checkpoint optimizer state: %w", err)
+			}
+			out.values, out.first, out.second, out.hasOptimizer = data[start:end], first, second, hasOptimizer
+			return out, nil
+		}
+	}
+	var header checkpointHeader
+	if err := json.Unmarshal(data, &header); err != nil {
+		return out, err
+	}
+	out.header = header
+	out.values = header.Values
+	if header.Optimizer != nil {
+		out.first, out.second, out.hasOptimizer = header.Optimizer.First, header.Optimizer.Second, true
+	}
+	return out, nil
+}
+
+// safetensorsCheckpointMinParams is the parameter count at which SaveCheckpoint
+// switches containers. Below it a JSON checkpoint is small and easy to inspect
+// with ordinary tools; above it the same state is hundreds of megabytes of
+// decimal text (a 6M-parameter model with Adam moments is ~370 MB) that has to
+// be parsed number by number.
+const safetensorsCheckpointMinParams = 1 << 20
+
+// SaveCheckpoint writes tokenizer, weights, and training state (optimizer
+// moments, step count, seed) to path.
+//
+// Models at or above safetensorsCheckpointMinParams are written in safetensors
+// format; smaller ones stay JSON. LoadCheckpoint detects either container, so
+// both load back the same way. Prefer a .safetensors path for large models: the
+// file is binary even when the path ends in .json.
+//
+// The write is atomic (temporary file, fsync, rename, directory fsync) and is
+// refused when the model holds non-finite weights or moments. See
+// docs/CHECKPOINTS.md for the durability guarantees and the integrity checks
+// LoadCheckpoint applies.
+func (m *Model) SaveCheckpoint(path string) error {
+	if m.ParameterCount() >= safetensorsCheckpointMinParams {
+		return m.SaveSafetensorsCheckpoint(path)
+	}
+	return m.saveJSONCheckpoint(path)
+}
+
+// saveJSONCheckpoint writes the JSON checkpoint container atomically: a
+// temporary file, fsync, rename, then a directory fsync (see writeFileAtomic).
+// Non-finite weights or moments are refused rather than written.
+func (m *Model) saveJSONCheckpoint(path string) error {
+	if err := m.validateModelState(); err != nil {
+		return fmt.Errorf("refusing to save checkpoint: %w", err)
+	}
+	return writeFileAtomic(path, 0o600, func(dst io.Writer) error {
+		w := bufio.NewWriterSize(dst, 4*1024*1024)
+		if err := m.writeJSONCheckpoint(w); err != nil {
+			return err
+		}
+		return w.Flush()
+	})
+}
+
+// writeJSONCheckpoint streams the format-version-2 JSON container into w.
+func (m *Model) writeJSONCheckpoint(w *bufio.Writer) error {
+	if _, err := fmt.Fprintf(w, `{"format_version":2,"config":`); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	cfgBytes, err := json.Marshal(m.Config)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if _, err := w.Write(cfgBytes); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, `,"step":%d,"seed":%d,"tokenizer_hash":%q`, m.step, m.seed, TokenizerFingerprint(m.Tokenizer)); err != nil {
+		return err
+	}
+	if len(m.Tokenizer.SpecialTokens) > 0 {
+		stBytes, err := json.Marshal(m.Tokenizer.SpecialTokens)
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, `,"special_tokens":`); err != nil {
+			return err
+		}
+		if _, err := w.Write(stBytes); err != nil {
+			return err
+		}
+	}
+	stateTokens := make([][]byte, len(m.Tokenizer.Tokens))
+	for i, token := range m.Tokenizer.Tokens {
+		stateTokens[i] = []byte(token)
+	}
+	tokBytes, err := json.Marshal(stateTokens)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, `,"tokens":`); err != nil {
+		return err
+	}
+	if _, err := w.Write(tokBytes); err != nil {
+		return err
+	}
+	merges := make([]checkpointMerge, len(m.Tokenizer.Merges))
+	for i, merge := range m.Tokenizer.Merges {
+		merges[i] = checkpointMerge{[]byte(merge.Left), []byte(merge.Right), []byte(merge.Token)}
+	}
+	mgBytes, err := json.Marshal(merges)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, `,"merges":`); err != nil {
+		return err
+	}
+	if _, err := w.Write(mgBytes); err != nil {
+		return err
+	}
+
+	if _, err := fmt.Fprintf(w, `,"values":[`); err != nil {
+		return err
+	}
+	var buf [64]byte
+	firstVal := true
+	for _, p := range m.parameters {
+		for _, v := range p.values {
+			if !firstVal {
+				if err := w.WriteByte(','); err != nil {
+					return err
+				}
+			} else {
+				firstVal = false
+			}
+			b := strconv.AppendFloat(buf[:0], float64(v), 'g', -1, 32)
+			if _, err := w.Write(b); err != nil {
+				return err
+			}
+		}
+	}
+	if err := w.WriteByte(']'); err != nil {
+		return err
+	}
+
+	if m.hasOptimizerMoments() {
+		if _, err := fmt.Fprintf(w, `,"optimizer":{"first":[`); err != nil {
+			return err
+		}
+		firstVal = true
+		for _, p := range m.parameters {
+			for _, v := range p.first {
+				if !firstVal {
+					if err := w.WriteByte(','); err != nil {
+						return err
+					}
+				} else {
+					firstVal = false
+				}
+				b := strconv.AppendFloat(buf[:0], float64(v), 'g', -1, 32)
+				if _, err := w.Write(b); err != nil {
+					return err
+				}
+			}
+		}
+		if _, err := fmt.Fprintf(w, `],"second":[`); err != nil {
+			return err
+		}
+		firstVal = true
+		for _, p := range m.parameters {
+			for _, v := range p.second {
+				if !firstVal {
+					if err := w.WriteByte(','); err != nil {
+						return err
+					}
+				} else {
+					firstVal = false
+				}
+				b := strconv.AppendFloat(buf[:0], float64(v), 'g', -1, 32)
+				if _, err := w.Write(b); err != nil {
+					return err
+				}
+			}
+		}
+		if _, err := fmt.Fprintf(w, `]}`); err != nil {
+			return err
+		}
+	}
+
+	return w.WriteByte('}')
 }
 
 // LoadCheckpoint restores model topology, tokenizer, and weights.
@@ -905,57 +1316,66 @@ func LoadCheckpoint(path string) (*Model, error) {
 	if err != nil {
 		return nil, err
 	}
-	var state checkpoint
-	if err := json.Unmarshal(data, &state); err != nil {
+	if isSafetensorsContainer(data) {
+		return loadSafetensorsCheckpoint(data)
+	}
+	decoded, err := decodeCheckpoint(data)
+	if err != nil {
 		return nil, fmt.Errorf("decode checkpoint: %w", err)
 	}
-	tokenizer := &Tokenizer{
-		Tokens: make([]string, len(state.Tokens)),
-		Merges: make([]Merge, len(state.Merges)),
+	header := decoded.header
+	if header.FormatVersion < 0 || header.FormatVersion > checkpointFormatVersion {
+		return nil, fmt.Errorf("checkpoint format version %d is not supported (this build reads up to %d)",
+			header.FormatVersion, checkpointFormatVersion)
 	}
-	for i, token := range state.Tokens {
-		tokenizer.Tokens[i] = string(token)
+	tokenizer := tokenizerFromCheckpoint(header.Tokens, header.Merges, header.SpecialTokens)
+	if header.TokenizerHash != "" && TokenizerFingerprint(tokenizer) != header.TokenizerHash {
+		return nil, fmt.Errorf("checkpoint tokenizer hash %q does not match serialized tokenizer", header.TokenizerHash)
 	}
-	for i, merge := range state.Merges {
-		tokenizer.Merges[i] = Merge{string(merge.Left), string(merge.Right), string(merge.Token)}
-	}
-	tokenizer.reindex()
-	if state.TokenizerHash != "" && TokenizerFingerprint(tokenizer) != state.TokenizerHash {
-		return nil, fmt.Errorf("checkpoint tokenizer hash %q does not match serialized tokenizer", state.TokenizerHash)
-	}
-	model, err := NewModel(state.Config, tokenizer, 1)
+	model, err := NewModel(header.Config, tokenizer, 1)
 	if err != nil {
 		return nil, err
 	}
-	if len(state.Values) != model.ParameterCount() {
-		return nil, fmt.Errorf("checkpoint has %d parameters; model requires %d", len(state.Values), model.ParameterCount())
+	totalParams := model.ParameterCount()
+	if len(decoded.values) == 0 {
+		return nil, fmt.Errorf("checkpoint has 0 parameters; model requires %d", totalParams)
+	}
+	flatVals := make([]float32, totalParams)
+	if err := parseFloatSliceInto(decoded.values, flatVals); err != nil {
+		if hint := legacyLayoutHint(header.Config, len(tokenizer.Tokens), countJSONNumbers(decoded.values)); hint != "" {
+			return nil, fmt.Errorf("%w; %s", err, hint)
+		}
+		return nil, err
 	}
 	index := 0
 	for _, p := range model.parameters {
-		for i := range p.values {
-			p.values[i] = float32(state.Values[index])
-			index++
+		copy(p.values, flatVals[index:index+len(p.values)])
+		index += len(p.values)
+	}
+	if header.Step != 0 {
+		model.step = header.Step
+	}
+	if header.Seed != 0 {
+		model.seed = header.Seed
+	}
+	if decoded.hasOptimizer {
+		flatFirst := make([]float32, totalParams)
+		if err := parseFloatSliceInto(decoded.first, flatFirst); err != nil {
+			return nil, fmt.Errorf("checkpoint optimizer state: %w", err)
 		}
-	}
-	if state.Step != 0 {
-		model.step = state.Step
-	}
-	if state.Seed != 0 {
-		model.seed = state.Seed
-	}
-	if state.Optimizer != nil {
-		if len(state.Optimizer.First) != model.ParameterCount() || len(state.Optimizer.Second) != model.ParameterCount() {
-			return nil, fmt.Errorf("checkpoint optimizer state has %d/%d moments; model requires %d",
-				len(state.Optimizer.First), len(state.Optimizer.Second), model.ParameterCount())
+		flatSecond := make([]float32, totalParams)
+		if err := parseFloatSliceInto(decoded.second, flatSecond); err != nil {
+			return nil, fmt.Errorf("checkpoint optimizer state: %w", err)
 		}
-		idx := 0
+		index = 0
 		for _, p := range model.parameters {
-			for i := range p.values {
-				p.first[i] = float32(state.Optimizer.First[idx])
-				p.second[i] = float32(state.Optimizer.Second[idx])
-				idx++
-			}
+			copy(p.first, flatFirst[index:index+len(p.first)])
+			copy(p.second, flatSecond[index:index+len(p.second)])
+			index += len(p.values)
 		}
+	}
+	if err := model.validateModelState(); err != nil {
+		return nil, fmt.Errorf("checkpoint integrity: %w", err)
 	}
 	return model, nil
 }
@@ -963,3 +1383,33 @@ func LoadCheckpoint(path string) (*Model, error) {
 // Step returns the optimizer step count stored in this model (0 for
 // freshly initialized models). Used by model cards and packaging.
 func (m *Model) Step() int64 { return m.step }
+
+// ResetStep resets the model step counter to 0, allowing fine-tuning stages
+// (such as SFT or DPO) to run their own warmup and decay schedules starting from step 0.
+func (m *Model) ResetStep() {
+	m.step = 0
+}
+
+// hasOptimizerMoments reports whether any Adam moment is non-zero, which is
+// what decides whether optimizer state is written to a checkpoint.
+func (m *Model) hasOptimizerMoments() bool {
+	for _, p := range m.parameters {
+		for i := range p.first {
+			if p.first[i] != 0 || p.second[i] != 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ResetOptimizer clears the Adam first and second moments to zero while
+// retaining the learned weights.
+func (m *Model) ResetOptimizer() {
+	for _, p := range m.parameters {
+		for i := range p.first {
+			p.first[i] = 0
+			p.second[i] = 0
+		}
+	}
+}

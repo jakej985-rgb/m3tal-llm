@@ -453,6 +453,8 @@ func run(args []string) error {
 		return evalBench(args[1:])
 	case "chatdata":
 		return chatData(args[1:])
+	case "migrate":
+		return migrateCheckpoint(args[1:])
 	case "chat-eval":
 		return chatEval(args[1:])
 	case "serve":
@@ -462,7 +464,7 @@ func run(args []string) error {
 	case "package":
 		return packageModel(args[1:])
 	default:
-		return fmt.Errorf("unknown command %q; use train, eval, generate, instructions, dataset, chatdata, chat-eval, serve, model-card, package, backends, or model-info", args[0])
+		return fmt.Errorf("unknown command %q; use train, eval, generate, instructions, dataset, chatdata, chat-eval, migrate, serve, model-card, package, backends, or model-info", args[0])
 	}
 }
 
@@ -972,6 +974,38 @@ func datasetExport(args []string) error {
 		total += len(shard.Tokens)
 	}
 	fmt.Printf("exported %d tokens from %s (%d shards) to %s\n", total, flags.Arg(0), ds.Meta.ShardCount, *out)
+	return nil
+}
+
+// migrateCheckpoint re-exports a checkpoint written by a pre-current
+// architecture (learned positional embeddings and/or a two-matrix tanh MLP)
+// in the current layout, then verifies the result loads.
+func migrateCheckpoint(args []string) error {
+	flags := flag.NewFlagSet("migrate", flag.ContinueOnError)
+	in := flags.String("in", "", "legacy checkpoint to import (required)")
+	out := flags.String("out", "", "path for the migrated checkpoint (required)")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*in) == "" || strings.TrimSpace(*out) == "" {
+		return fmt.Errorf("--in and --out are required")
+	}
+	model, report, err := lm.LoadLegacyCheckpoint(*in)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("migrate %s\n", *in)
+	fmt.Printf("  %s\n", report.Note())
+	fmt.Printf("  config context %d width %d layers %d heads %d  vocab %d\n",
+		model.Config.Context, model.Config.Width, model.Config.Layers, model.Config.Heads,
+		len(model.Tokenizer.Tokens))
+	if err := model.SaveCheckpoint(*out); err != nil {
+		return err
+	}
+	if _, err := lm.LoadCheckpoint(*out); err != nil {
+		return fmt.Errorf("verify %s: %w", *out, err)
+	}
+	fmt.Printf("  wrote %s and verified it reloads as a current checkpoint\n", *out)
 	return nil
 }
 
