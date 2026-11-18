@@ -69,6 +69,7 @@ func run(args []string) error {
 		warmup := flags.Int64("warmup-steps", 0, "linear LR warmup steps")
 		minLRRatio := flags.Float64("min-lr-ratio", 0.1, "cosine LR decay floor as fraction of peak")
 		gradClip := flags.Float64("grad-clip", 1.0, "global gradient-norm clip threshold")
+		resetStep := flags.Bool("reset-step", false, "reset optimizer step count and moments to 0 (useful for fine-tuning stages)")
 		if err := flags.Parse(args[1:]); err != nil {
 			return err
 		}
@@ -82,6 +83,10 @@ func run(args []string) error {
 			model, err = lm.LoadCheckpoint(*baseModel)
 			if err != nil {
 				return fmt.Errorf("load base model: %w", err)
+			}
+			if *resetStep {
+				model.ResetStep()
+				model.ResetOptimizer()
 			}
 			tokenizer = model.Tokenizer
 			if strings.TrimSpace(*corpusArg) != "" {
@@ -187,7 +192,7 @@ func run(args []string) error {
 			}
 			maxSteps := *maxSteps
 			if maxSteps == 0 {
-				maxSteps = int64(*epochs) * int64(*steps)
+				maxSteps = model.Step() + int64(*epochs)*int64(*steps)
 			}
 			cfg := lm.DPOConfig{
 				TrainConfig: lm.TrainConfig{
@@ -280,7 +285,7 @@ func run(args []string) error {
 			}
 			maxSteps := *maxSteps
 			if maxSteps == 0 {
-				maxSteps = int64(*epochs) * int64(*steps)
+				maxSteps = model.Step() + int64(*epochs)*int64(*steps)
 			}
 			stream := lm.NewTokenStream(ds, order, *seed)
 			cfg := lm.TrainConfig{
@@ -311,8 +316,12 @@ func run(args []string) error {
 				}
 			}
 			source := lm.NewSliceSource(tokens)
+			maxSteps := *maxSteps
+			if maxSteps == 0 {
+				maxSteps = model.Step() + int64(*epochs)*int64(*steps)
+			}
 			cfg := lm.TrainConfig{
-				MaxSteps:     int64(*epochs) * int64(*steps),
+				MaxSteps:     maxSteps,
 				LearningRate: *learningRate,
 				WarmupSteps:  *warmup,
 				MinLRRatio:   *minLRRatio,
