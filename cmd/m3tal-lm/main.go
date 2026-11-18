@@ -1019,8 +1019,25 @@ func migrateCheckpoint(args []string) error {
 	return nil
 }
 
-// evalBenchReport is the machine-readable output of `eval-bench`.
+// checkEvalCompatibility prints any warnings from an identity comparison and
+// returns an error when the baseline measured something different: a delta
+// between incompatible evaluations would be meaningless, so the run refuses.
+func checkEvalCompatibility(label string, base, current lm.EvalIdentity) error {
+	cmp := lm.CompareEvalIdentities(base, current)
+	for _, warning := range cmp.Warnings {
+		fmt.Printf("  warning: %s\n", warning)
+	}
+	if !cmp.Compatible {
+		return fmt.Errorf("%s baseline is not comparable: %s", label, strings.Join(cmp.Refusals, "; "))
+	}
+	return nil
+}
+
+// evalBenchReport is the machine-readable output of `eval-bench`. Identity
+// records the exact model, tokenizer, data, context, mode and backend the
+// numbers belong to, so baseline comparisons can refuse mismatched runs.
 type evalBenchReport struct {
+	Identity    lm.EvalIdentity `json:"identity"`
 	Checkpoint  string          `json:"checkpoint"`
 	EvalMode    string          `json:"eval_mode"`
 	Backend     string          `json:"backend"`
@@ -1071,9 +1088,16 @@ func evalBench(args []string) error {
 	if err != nil {
 		return err
 	}
-	texts, err := lm.LoadCorpus(strings.Split(*corpusArg, string(os.PathListSeparator)))
+	corpusPaths := strings.Split(*corpusArg, string(os.PathListSeparator))
+	texts, err := lm.LoadCorpus(corpusPaths)
 	if err != nil {
 		return err
+	}
+	// The corpus token count before capping: the identity must distinguish
+	// "whole corpus" from "first N tokens of the corpus".
+	corpusTokens := 0
+	for _, text := range texts {
+		corpusTokens += len(model.Tokenizer.Encode(text)) + len(model.Tokenizer.Encode("\n"))
 	}
 	// Bound evaluation cost: Evaluate runs one forward pass per token, so
 	// cap the token count and truncate texts deterministically.
@@ -1126,7 +1150,21 @@ func evalBench(args []string) error {
 		}
 	}
 
+	identity, err := lm.BuildEvalIdentity(model, lm.EvalIdentityInput{
+		Mode:           *evalMode,
+		Backend:        kernel.Selected(),
+		CheckpointPath: *checkpoint,
+		DatasetPaths:   corpusPaths,
+		DatasetSplit:   "held-out",
+		DatasetTokens:  int64(corpusTokens),
+		TokenCount:     int64(evalTokens),
+	})
+	if err != nil {
+		return err
+	}
+
 	rep := evalBenchReport{
+		Identity:    identity,
 		Checkpoint:  *checkpoint,
 		EvalMode:    *evalMode,
 		Backend:     kernel.Selected(),
@@ -1164,6 +1202,9 @@ func evalBench(args []string) error {
 		var base evalBenchReport
 		if err := json.Unmarshal(data, &base); err != nil {
 			return fmt.Errorf("decode baseline: %w", err)
+		}
+		if err := checkEvalCompatibility("eval-bench", base.Identity, rep.Identity); err != nil {
+			return err
 		}
 		diff := rep.EvalLoss - base.EvalLoss
 		fmt.Printf("  baseline loss %.4f (delta %+.4f, threshold %.4f)\n", base.EvalLoss, diff, *maxIncrease)
@@ -1282,7 +1323,11 @@ func chatEval(args []string) error {
 	if err != nil {
 		return err
 	}
-	report, err := model.RunChatEval(entries, *checkpoint)
+	report, err := model.RunChatEval(entries, lm.ChatEvalOptions{
+		CheckpointPath: *checkpoint,
+		SuitePath:      *suite,
+		Backend:        kernel.Selected(),
+	})
 	if err != nil {
 		return err
 	}
@@ -1311,6 +1356,9 @@ func chatEval(args []string) error {
 		var base lm.ChatEvalReport
 		if err := json.Unmarshal(data, &base); err != nil {
 			return fmt.Errorf("decode baseline: %w", err)
+		}
+		if err := checkEvalCompatibility("chat-eval", base.Identity, report.Identity); err != nil {
+			return err
 		}
 		if report.ScoredExamples > 0 && base.ScoredExamples > 0 {
 			delta := report.AssistantLoss - base.AssistantLoss

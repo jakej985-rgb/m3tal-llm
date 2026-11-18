@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"m3tal-llm/internal/lm"
 )
@@ -187,6 +188,19 @@ func TestChatStreamSSE(t *testing.T) {
 	text := body.String()
 	if !strings.Contains(text, "data: ") || !strings.Contains(text, "[DONE]") {
 		t.Fatalf("bad SSE stream: %q", text)
+	}
+}
+
+// TestRequestTimeoutEnforced verifies Policy.RequestTimeout actually stops
+// generation: an already-expired deadline must fail fast, not generate.
+func TestRequestTimeoutEnforced(t *testing.T) {
+	_, ts := testServer(t, Policy{RequestTimeout: time.Nanosecond, MaxOutputTokens: 64})
+	time.Sleep(2 * time.Millisecond)
+	resp, body := post(t, ts.URL+"/v1/generate", map[string]any{
+		"prompt": "Hello", "max_tokens": 64,
+	})
+	if resp.StatusCode != http.StatusGatewayTimeout {
+		t.Fatalf("status %d body %s", resp.StatusCode, body)
 	}
 }
 

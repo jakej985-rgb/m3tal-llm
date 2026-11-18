@@ -1,6 +1,7 @@
 package lm
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"math/rand"
@@ -113,8 +114,10 @@ func pickCandidate(cands []sampleCandidate, temperature float64, rng *rand.Rand)
 // generateCore runs autoregressive generation, invoking emit with decoded
 // text deltas when non-nil. Stop markers halt generation and are removed
 // from the returned text. An emit error cancels generation; the partial
-// output and the error are both returned.
-func (m *Model) generateCore(prompt string, opts GenerateOptions, emit func(string) error) (string, bool, error) {
+// output and the error are both returned. Generation also stops at the next
+// token boundary once ctx is done, returning ctx.Err(); pass
+// context.Background() for no cancellation.
+func (m *Model) generateCore(ctx context.Context, prompt string, opts GenerateOptions, emit func(string) error) (string, bool, error) {
 	if err := opts.Validate(); err != nil {
 		return "", false, err
 	}
@@ -126,6 +129,10 @@ func (m *Model) generateCore(prompt string, opts GenerateOptions, emit func(stri
 	if len(ids) == 0 {
 		ids = m.Tokenizer.Encode(" ")
 	}
+	m.Config.Normalize()
+	if len(ids) > m.Config.Context {
+		ids = ids[len(ids)-m.Config.Context:]
+	}
 	prefix := []byte(m.Tokenizer.Decode(ids))
 	genOffset := len(prefix) // byte offset where generated text begins
 	backend, rng := m.inferenceBackend(), rand.New(rand.NewSource(opts.Seed))
@@ -134,7 +141,6 @@ func (m *Model) generateCore(prompt string, opts GenerateOptions, emit func(stri
 	genIDs := make([]int, 0, opts.MaxTokens)
 
 	// KV-cache prefill.
-	m.Config.Normalize()
 	kvCache := backend.NewKVCache()
 	defer kvCache.Free()
 	var rawLogits []float32
@@ -146,6 +152,9 @@ func (m *Model) generateCore(prompt string, opts GenerateOptions, emit func(stri
 	emitted := 0 // bytes of generated text already streamed
 
 	for n := 0; n < opts.MaxTokens; n++ {
+		if err := ctx.Err(); err != nil {
+			return string(prefix[genOffset:]), false, err
+		}
 		logits := append([]float32(nil), rawLogits...)
 
 		if penalty > 1.0 {
@@ -270,7 +279,16 @@ func (m *Model) generateCore(prompt string, opts GenerateOptions, emit func(stri
 
 // GenerateWithOptions generates text with the given sampling options.
 func (m *Model) GenerateWithOptions(prompt string, opts GenerateOptions) (string, error) {
-	out, _, err := m.generateCore(prompt, opts, nil)
+	out, _, err := m.generateCore(context.Background(), prompt, opts, nil)
+	return out, err
+}
+
+// GenerateWithContext is GenerateWithOptions that stops at the next token
+// boundary once ctx is cancelled or its deadline passes, returning the text
+// generated so far together with ctx.Err(). When emit is non-nil it receives
+// each decoded text delta as it is produced, like GenerateStream.
+func (m *Model) GenerateWithContext(ctx context.Context, prompt string, opts GenerateOptions, emit func(string) error) (string, error) {
+	out, _, err := m.generateCore(ctx, prompt, opts, emit)
 	return out, err
 }
 
@@ -279,7 +297,7 @@ func (m *Model) GenerateWithOptions(prompt string, opts GenerateOptions) (string
 // error, generation stops and the partial output is returned with the
 // error wrapped as "stream cancelled".
 func (m *Model) GenerateStream(prompt string, opts GenerateOptions, emit func(string) error) (string, error) {
-	out, _, err := m.generateCore(prompt, opts, emit)
+	out, _, err := m.generateCore(context.Background(), prompt, opts, emit)
 	return out, err
 }
 

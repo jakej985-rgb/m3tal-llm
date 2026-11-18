@@ -40,9 +40,25 @@ func TestRunChatEval(t *testing.T) {
 			{Role: RoleUser, Content: "Say hi"},
 		}, MaxTokens: 4},
 	}
-	report, err := m.RunChatEval(entries, "test-ckpt")
+	ckpt := filepath.Join(t.TempDir(), "ckpt.json")
+	if err := m.SaveCheckpoint(ckpt); err != nil {
+		t.Fatal(err)
+	}
+	report, err := m.RunChatEval(entries, ChatEvalOptions{CheckpointPath: ckpt, Backend: "cpu"})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if report.Identity.EvaluatorVersion != EvaluatorVersion {
+		t.Fatalf("identity evaluator = %q", report.Identity.EvaluatorVersion)
+	}
+	if report.Identity.EvalMode != EvalModeChat {
+		t.Fatalf("identity mode = %q", report.Identity.EvalMode)
+	}
+	if report.Identity.TokenCount != report.MaskedTokens {
+		t.Fatalf("identity tokens %d != masked %d", report.Identity.TokenCount, report.MaskedTokens)
+	}
+	if report.Identity.DatasetSHA256 == "" || report.Identity.ModelSHA256 == "" {
+		t.Fatal("identity missing dataset/model fingerprints")
 	}
 	if report.ScoredExamples != 1 || report.MaskedTokens <= 0 {
 		t.Fatalf("scored=%d masked=%d", report.ScoredExamples, report.MaskedTokens)

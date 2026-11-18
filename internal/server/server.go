@@ -161,8 +161,12 @@ func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		RepetitionPenalty: req.RepetitionPenalty,
 		Stop:              req.Stop,
 	}
-	out, err := s.model.GenerateWithOptions(req.Prompt, opts)
+	out, err := s.model.GenerateWithContext(ctx, req.Prompt, opts, nil)
 	if err != nil {
+		if ctx.Err() != nil {
+			writeError(w, http.StatusGatewayTimeout, "request exceeded the generation timeout")
+			return
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -225,11 +229,15 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		Stop:              append(append([]string{}, req.Stop...), lm.StopMarkers()...),
 	}
 	if req.Stream {
-		s.handleChatStream(w, promptText, opts)
+		s.handleChatStream(ctx, w, promptText, opts)
 		return
 	}
-	out, err := s.model.GenerateWithOptions(promptText, opts)
+	out, err := s.model.GenerateWithContext(ctx, promptText, opts, nil)
 	if err != nil {
+		if ctx.Err() != nil {
+			writeError(w, http.StatusGatewayTimeout, "request exceeded the generation timeout")
+			return
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -242,7 +250,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 // handleChatStream serves Server-Sent Events: each "data:" line carries
 // {"delta": "..."}; the stream ends with "data: [DONE]".
-func (s *Server) handleChatStream(w http.ResponseWriter, prompt string, opts lm.GenerateOptions) {
+func (s *Server) handleChatStream(ctx context.Context, w http.ResponseWriter, prompt string, opts lm.GenerateOptions) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming unsupported")
@@ -262,7 +270,7 @@ func (s *Server) handleChatStream(w http.ResponseWriter, prompt string, opts lm.
 		flusher.Flush()
 		return true
 	}
-	_, err := s.model.GenerateStream(prompt, opts, func(delta string) error {
+	_, err := s.model.GenerateWithContext(ctx, prompt, opts, func(delta string) error {
 		if !writeSSE(map[string]string{"delta": delta}) {
 			return fmt.Errorf("client disconnected")
 		}

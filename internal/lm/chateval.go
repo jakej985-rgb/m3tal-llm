@@ -2,6 +2,7 @@ package lm
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -151,8 +152,10 @@ type ChatProbeResult struct {
 	AutomatedOnly bool   `json:"automated_only"` // true: heuristics only, human review needed
 }
 
-// ChatEvalReport is the machine-readable eval output.
+// ChatEvalReport is the machine-readable eval output. Identity binds the
+// numbers to the exact model, tokenizer, suite, mode and backend.
 type ChatEvalReport struct {
+	Identity          EvalIdentity      `json:"identity"`
 	TemplateVersion   string            `json:"template_version"`
 	TokenizerHash     string            `json:"tokenizer_hash"`
 	Checkpoint        string            `json:"checkpoint,omitempty"`
@@ -169,10 +172,19 @@ type ChatEvalReport struct {
 	Note              string            `json:"note"`
 }
 
+// ChatEvalOptions identifies the inputs of one chat-eval run. SuitePath is
+// hashed into the report identity; when it is empty the entries themselves are
+// hashed instead.
+type ChatEvalOptions struct {
+	CheckpointPath string
+	SuitePath      string
+	Backend        string
+}
+
 // RunChatEval executes the suite: scored examples contribute to masked
 // assistant-token loss; probes are generated with the entry's decoding
 // settings (defaults: greedy, 32 tokens, chat stop markers).
-func (m *Model) RunChatEval(entries []ChatEvalEntry, checkpointPath string) (*ChatEvalReport, error) {
+func (m *Model) RunChatEval(entries []ChatEvalEntry, opts ChatEvalOptions) (*ChatEvalReport, error) {
 	var scored []ChatExample
 	var probes []ChatEvalEntry
 	for _, e := range entries {
@@ -186,7 +198,7 @@ func (m *Model) RunChatEval(entries []ChatEvalEntry, checkpointPath string) (*Ch
 	report := &ChatEvalReport{
 		TemplateVersion: ChatTemplateVersion,
 		TokenizerHash:   TokenizerFingerprint(m.Tokenizer),
-		Checkpoint:      checkpointPath,
+		Checkpoint:      opts.CheckpointPath,
 		Probes:          []ChatProbeResult{},
 		Note:            "automated metrics are heuristics only; relevance/coherence/adherence require human review of recorded outputs",
 	}
@@ -217,7 +229,7 @@ func (m *Model) RunChatEval(entries []ChatEvalEntry, checkpointPath string) (*Ch
 			Seed:        17,
 			Stop:        StopMarkers(),
 		}
-		out, stopHit, err := m.generateCore(promptText, opts, nil)
+		out, stopHit, err := m.generateCore(context.Background(), promptText, opts, nil)
 		if err != nil {
 			return nil, fmt.Errorf("probe %s: %w", e.ID, err)
 		}
@@ -243,7 +255,41 @@ func (m *Model) RunChatEval(entries []ChatEvalEntry, checkpointPath string) (*Ch
 		report.Probes = append(report.Probes, res)
 	}
 	report.ProbeCount = len(probes)
+
+	paths := []string(nil)
+	if opts.SuitePath != "" {
+		paths = []string{opts.SuitePath}
+	}
+	identity, err := BuildEvalIdentity(m, EvalIdentityInput{
+		Mode:           EvalModeChat,
+		Backend:        opts.Backend,
+		CheckpointPath: opts.CheckpointPath,
+		DatasetPaths:   paths,
+		DatasetTexts:   chatEvalSuiteTexts(entries),
+		DatasetSplit:   "chat-eval-suite",
+		DatasetItems:   len(entries),
+		DatasetTokens:  report.MaskedTokens,
+		TokenCount:     report.MaskedTokens,
+	})
+	if err != nil {
+		return nil, err
+	}
+	report.Identity = identity
 	return report, nil
+}
+
+// chatEvalSuiteTexts renders suite entries canonically so an in-memory suite
+// hashes identically to the JSONL it was parsed from.
+func chatEvalSuiteTexts(entries []ChatEvalEntry) []string {
+	texts := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		data, err := json.Marshal(entry)
+		if err != nil {
+			continue
+		}
+		texts = append(texts, string(data))
+	}
+	return texts
 }
 
 // expLoss returns e^loss for perplexity reporting.
