@@ -32,45 +32,34 @@ type sftWindow struct {
 	input   []int
 	targets []int
 	mask    []bool // per-target mask: true = assistant token (loss applies)
+	masked  int    // number of masked (loss) positions
 }
 
 // PrepareChatExamples serializes chat examples into masked windows of at
-// most context+1 tokens, dropping overflow from the front so the most
-// recent turns are kept.
-func (m *Model) PrepareChatExamples(examples []ChatExample) ([]sftWindow, int64, error) {
+// most context+1 tokens. Windows are built message-by-message: leading
+// system messages and the active request plus its reply are protected,
+// earlier history is dropped as whole messages, and examples that cannot
+// fit are dropped with a counted reason instead of being cut mid-message
+// (see windows.go for the policy).
+func (m *Model) PrepareChatExamples(examples []ChatExample) ([]sftWindow, WindowReport, error) {
 	context := m.Config.Context
-	var windows []sftWindow
-	var maskedTotal int64
+	report := newWindowReport(context)
+	windows := make([]sftWindow, 0, len(examples))
 	for _, ex := range examples {
-		ids, idMask := ex.SerializedParts(m.Tokenizer)
-		if len(ids) < 2 {
+		report.Examples++
+		w, trimmed, err := m.buildChatWindow(ex.Conversation)
+		if err != nil {
+			report.drop(err)
 			continue
 		}
-		if len(ids) > context+1 {
-			ids = ids[len(ids)-(context+1):]
-			idMask = idMask[len(idMask)-(context+1):]
-		}
-		input := make([]int, len(ids)-1)
-		targets := make([]int, len(ids)-1)
-		mask := make([]bool, len(ids)-1)
-		hasActive := false
-		for i := range input {
-			input[i] = ids[i]
-			targets[i] = ids[i+1]
-			mask[i] = idMask[i+1]
-			if mask[i] {
-				hasActive = true
-				maskedTotal++
-			}
-		}
-		if hasActive {
-			windows = append(windows, sftWindow{input, targets, mask})
-		}
+		report.retain(int64(len(w.input)+1), int64(w.masked), trimmed)
+		windows = append(windows, w)
 	}
 	if len(windows) == 0 {
-		return nil, 0, fmt.Errorf("no chat examples produce assistant-masked windows within context %d", context)
+		return nil, report, fmt.Errorf("no chat examples produce assistant-masked windows within context %d (%d dropped: %s)",
+			context, report.Dropped, report.DropSummary())
 	}
-	return windows, maskedTotal, nil
+	return windows, report, nil
 }
 
 // TrainChat runs SFT over chat examples until cfg.MaxSteps is reached.
@@ -85,11 +74,11 @@ func (m *Model) TrainChat(examples []ChatExample, cfg TrainConfig, logf func(SFT
 	if len(examples) == 0 {
 		return 0, fmt.Errorf("chat examples required")
 	}
-	windows, maskedTotal, err := m.PrepareChatExamples(examples)
+	windows, _, err := m.PrepareChatExamples(examples)
 	if err != nil {
 		return 0, err
 	}
-	m.backend = nil
+	m.invalidateBackend()
 
 	rng := rand.New(rand.NewSource(cfg.Seed))
 	var totalLoss float64
@@ -147,25 +136,30 @@ func (m *Model) TrainChat(examples []ChatExample, cfg TrainConfig, logf func(SFT
 			ExamplesSeen: examplesSeen,
 		})
 	}
-	_ = maskedTotal // reserved for reports; per-step counts are authoritative
 	return totalLoss / float64(steps), nil
 }
 
 // SFTSummary describes a completed SFT run for reports/checkpoints.
 type SFTSummary struct {
-	TemplateVersion string  `json:"template_version"`
-	TokenizerHash   string  `json:"tokenizer_hash"`
-	Examples        int     `json:"examples"`
-	Windows         int     `json:"windows"`
-	MaskedTokens    int64   `json:"masked_tokens"`
-	FinalLoss       float64 `json:"final_loss"`
-	Steps           int64   `json:"steps"`
+	TemplateVersion string           `json:"template_version"`
+	TokenizerHash   string           `json:"tokenizer_hash"`
+	Examples        int              `json:"examples"`
+	Windows         int              `json:"windows"`
+	Retained        int64            `json:"retained"`
+	Dropped         int64            `json:"dropped"`
+	DroppedByReason map[string]int64 `json:"dropped_by_reason,omitempty"`
+	ExamplesTrimmed int64            `json:"examples_trimmed"`
+	MessagesTrimmed int64            `json:"messages_trimmed"`
+	WindowTokens    int64            `json:"window_tokens"`
+	MaskedTokens    int64            `json:"masked_tokens"`
+	FinalLoss       float64          `json:"final_loss"`
+	Steps           int64            `json:"steps"`
 }
 
 // SummarizeSFT prepares examples (dry-run) and reports dataset statistics
 // without training — used by the CLI to log token counts before a run.
 func (m *Model) SummarizeSFT(examples []ChatExample) (SFTSummary, error) {
-	windows, maskedTotal, err := m.PrepareChatExamples(examples)
+	windows, report, err := m.PrepareChatExamples(examples)
 	if err != nil {
 		return SFTSummary{}, err
 	}
@@ -174,7 +168,13 @@ func (m *Model) SummarizeSFT(examples []ChatExample) (SFTSummary, error) {
 		TokenizerHash:   TokenizerFingerprint(m.Tokenizer),
 		Examples:        len(examples),
 		Windows:         len(windows),
-		MaskedTokens:    maskedTotal,
+		Retained:        report.Retained,
+		Dropped:         report.Dropped,
+		DroppedByReason: report.DroppedByReason,
+		ExamplesTrimmed: report.ExamplesTrimmed,
+		MessagesTrimmed: report.MessagesTrimmed,
+		WindowTokens:    report.WindowTokens,
+		MaskedTokens:    report.MaskedTokens,
 		Steps:           m.step,
 	}, nil
 }

@@ -61,7 +61,7 @@ func TestLoadPreferenceJSONL(t *testing.T) {
 func dpoModels(t *testing.T) (*Model, *Model) {
 	t.Helper()
 	tok := testChatTokenizer(t)
-	cfg := Config{Context: 64, Width: 32, Layers: 2, Heads: 4}
+	cfg := Config{Context: 256, Width: 32, Layers: 2, Heads: 4}
 	m, err := NewModel(cfg, tok, 1)
 	if err != nil {
 		t.Fatal(err)

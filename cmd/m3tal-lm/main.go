@@ -201,10 +201,15 @@ func run(args []string) error {
 				},
 				Beta: 0.1,
 			}
-			loss, err := model.TrainDPO(pairs, refModel, cfg, func(m lm.TrainMetrics) {
+			loss, report, err := model.TrainDPOWithReport(pairs, refModel, cfg, func(m lm.TrainMetrics) {
 				fmt.Printf("dpo step %d loss %.4f lr %.2e grad %.3f\n",
 					m.Step, m.Loss, m.LearningRate, m.GradNorm)
 			})
+			if report.Examples > 0 {
+				fmt.Printf("dpo windows: %d pairs → %d retained, %d dropped (%s), %d trimmed (%d messages)\n",
+					report.Examples, report.Retained, report.Dropped, report.DropSummary(),
+					report.ExamplesTrimmed, report.MessagesTrimmed)
+			}
 			if err != nil {
 				return fmt.Errorf("dpo train: %w", err)
 			}
@@ -228,9 +233,14 @@ func run(args []string) error {
 			}
 			fmt.Printf("sft: %d examples → %d windows, %d assistant (masked) tokens, template %s\n",
 				summary.Examples, summary.Windows, summary.MaskedTokens, summary.TemplateVersion)
+			if summary.Examples > 0 {
+				fmt.Printf("sft windows: %d retained, %d dropped (%s), %d trimmed (%d messages)\n",
+					summary.Retained, summary.Dropped, lm.FormatDropReasons(summary.DroppedByReason),
+					summary.ExamplesTrimmed, summary.MessagesTrimmed)
+			}
 			maxSteps := *maxSteps
 			if maxSteps == 0 {
-				maxSteps = int64(*epochs) * int64(*steps)
+				maxSteps = model.Step() + int64(*epochs)*int64(*steps)
 			}
 			cfg := lm.TrainConfig{
 				MaxSteps:     maxSteps,

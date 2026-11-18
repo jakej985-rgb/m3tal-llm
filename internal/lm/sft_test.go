@@ -28,7 +28,7 @@ func sftTestExamples() []ChatExample {
 func sftTestModel(t *testing.T) *Model {
 	t.Helper()
 	tok := testChatTokenizer(t)
-	cfg := Config{Context: 64, Width: 32, Layers: 2, Heads: 4}
+	cfg := Config{Context: 256, Width: 32, Layers: 2, Heads: 4}
 	m, err := NewModel(cfg, tok, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -38,15 +38,18 @@ func sftTestModel(t *testing.T) *Model {
 
 func TestPrepareChatExamplesMasks(t *testing.T) {
 	m := sftTestModel(t)
-	wins, masked, err := m.PrepareChatExamples(sftTestExamples())
+	wins, report, err := m.PrepareChatExamples(sftTestExamples())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(wins) != 3 {
 		t.Fatalf("windows=%d want 3", len(wins))
 	}
-	if masked <= 0 {
+	if report.MaskedTokens <= 0 {
 		t.Fatal("no masked tokens counted")
+	}
+	if report.Retained != 3 || report.Dropped != 0 {
+		t.Fatalf("report retained=%d dropped=%d (%s)", report.Retained, report.Dropped, report.DropSummary())
 	}
 	for _, w := range wins {
 		active := false

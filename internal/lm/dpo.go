@@ -120,33 +120,56 @@ type dpoWindow struct {
 	active  int // number of masked target positions
 }
 
-// prepareDPOSequence serializes a conversation into a masked window.
-func (m *Model) prepareDPOSequence(conv Conversation) (dpoWindow, error) {
-	ids, idMask := conv.SerializedParts(m.Tokenizer)
-	if len(ids) < 2 {
-		return dpoWindow{}, fmt.Errorf("sequence too short")
+func asDPOWindow(w sftWindow) dpoWindow {
+	return dpoWindow{input: w.input, targets: w.targets, mask: w.mask, active: w.masked}
+}
+
+// dpoWindows serializes one preference pair into chosen and rejected
+// windows that share an identical prompt.
+//
+// Policy: the prompt is trimmed once, with whole messages only, against
+// the budget left by the LONGER of the two replies. Both sides therefore
+// see the same context, the same truncation, and complete replies; the
+// pair is dropped (not compared asymmetrically) when no prompt budget
+// remains.
+func (m *Model) dpoWindows(p PreferencePair) (dpoWindow, dpoWindow, int, error) {
+	budget := m.Config.Context + 1
+	promptBlocks := Conversation{Messages: p.Prompt}.messageTokens(m.Tokenizer)
+	chosenBlocks := Conversation{Messages: []ChatMessage{{Role: RoleAssistant, Content: p.Chosen}}}.messageTokens(m.Tokenizer)
+	rejectedBlocks := Conversation{Messages: []ChatMessage{{Role: RoleAssistant, Content: p.Rejected}}}.messageTokens(m.Tokenizer)
+
+	chosenLen := sumTokens(chosenBlocks)
+	rejectedLen := sumTokens(rejectedBlocks)
+	replyLen := chosenLen
+	if rejectedLen > replyLen {
+		replyLen = rejectedLen
 	}
-	if len(ids) > m.Config.Context+1 {
-		ids = ids[len(ids)-(m.Config.Context+1):]
-		idMask = idMask[len(idMask)-(m.Config.Context+1):]
+	promptBudget := budget - replyLen
+	if promptBudget < 2 {
+		return dpoWindow{}, dpoWindow{}, 0, dropf(DropOversizedTarget,
+			"longest reply is %d tokens, leaving %d of %d for the shared prompt", replyLen, promptBudget, budget)
 	}
-	w := dpoWindow{
-		input:   make([]int, len(ids)-1),
-		targets: make([]int, len(ids)-1),
-		mask:    make([]bool, len(ids)-1),
+
+	keep, trimmed, err := selectMessages(promptBlocks, promptBudget)
+	if err != nil {
+		return dpoWindow{}, dpoWindow{}, 0, err
 	}
-	for i := range w.input {
-		w.input[i] = ids[i]
-		w.targets[i] = ids[i+1]
-		w.mask[i] = idMask[i+1]
-		if w.mask[i] {
-			w.active++
-		}
+	promptIDs, promptMask := assemble(promptBlocks, keep)
+
+	chosenIDs := append(append([]int{}, promptIDs...), chosenBlocks[0].ids...)
+	chosenMask := append(append([]bool{}, promptMask...), chosenBlocks[0].mask...)
+	rejectedIDs := append(append([]int{}, promptIDs...), rejectedBlocks[0].ids...)
+	rejectedMask := append(append([]bool{}, promptMask...), rejectedBlocks[0].mask...)
+
+	cw, err := buildMaskedWindow(chosenIDs, chosenMask)
+	if err != nil {
+		return dpoWindow{}, dpoWindow{}, 0, err
 	}
-	if w.active == 0 {
-		return dpoWindow{}, fmt.Errorf("no assistant tokens in window")
+	rw, err := buildMaskedWindow(rejectedIDs, rejectedMask)
+	if err != nil {
+		return dpoWindow{}, dpoWindow{}, 0, err
 	}
-	return w, nil
+	return asDPOWindow(cw), asDPOWindow(rw), trimmed, nil
 }
 
 // maskedLogprobSum returns the summed log-probability of masked target
@@ -190,17 +213,6 @@ func (c *DPOConfig) Normalize() {
 	}
 }
 
-// seqLogprob returns summed masked logprob of a conversation's assistant
-// tokens under this model.
-func (m *Model) seqLogprob(conv Conversation) (float64, error) {
-	w, err := m.prepareDPOSequence(conv)
-	if err != nil {
-		return 0, err
-	}
-	cache := m.forward(w.input)
-	return maskedLogprobSum(cache, w), nil
-}
-
 // dpoPairData is a prepared preference pair with frozen reference
 // logprobs.
 type dpoPairData struct {
@@ -208,28 +220,21 @@ type dpoPairData struct {
 	chosen     dpoWindow
 	rejected   dpoWindow
 	refC, refR float64
+	trimmed    int // whole prompt messages dropped for budget
 }
 
 // prepareDPOPair builds masked windows and reference logprobs for one
-// preference pair. Reference logprobs are computed once (ref is frozen).
+// preference pair. Reference logprobs are computed once (ref is frozen)
+// on the exact same windows the policy model trains on, so the two sides
+// of the DPO ratio always see identical sequences.
 func (m *Model) prepareDPOPair(p PreferencePair, ref *Model) (dpoPairData, error) {
-	cw, err := m.prepareDPOSequence(p.Conversation(true))
+	cw, rw, trimmed, err := m.dpoWindows(p)
 	if err != nil {
 		return dpoPairData{}, err
 	}
-	rw, err := m.prepareDPOSequence(p.Conversation(false))
-	if err != nil {
-		return dpoPairData{}, err
-	}
-	lpC, err := ref.seqLogprob(p.Conversation(true))
-	if err != nil {
-		return dpoPairData{}, err
-	}
-	lpR, err := ref.seqLogprob(p.Conversation(false))
-	if err != nil {
-		return dpoPairData{}, err
-	}
-	return dpoPairData{pair: p, chosen: cw, rejected: rw, refC: lpC, refR: lpR}, nil
+	lpC := maskedLogprobSum(ref.forward(cw.input), cw)
+	lpR := maskedLogprobSum(ref.forward(rw.input), rw)
+	return dpoPairData{pair: p, chosen: cw, rejected: rw, refC: lpC, refR: lpR, trimmed: trimmed}, nil
 }
 
 // dpoAccumGrads accumulates the DPO loss gradient for one prepared pair
@@ -268,33 +273,46 @@ func (m *Model) dpoLossValue(d dpoPairData, beta float64) float64 {
 // the policy model (same architecture/tokenizer, loaded from the same
 // checkpoint); its weights are never modified. Returns mean DPO loss.
 func (m *Model) TrainDPO(pairs []PreferencePair, ref *Model, cfg DPOConfig, logf func(TrainMetrics)) (float64, error) {
+	loss, _, err := m.TrainDPOWithReport(pairs, ref, cfg, logf)
+	return loss, err
+}
+
+// TrainDPOWithReport is TrainDPO plus the window retention report, so
+// callers can log how many pairs were kept, trimmed, or dropped and why.
+func (m *Model) TrainDPOWithReport(pairs []PreferencePair, ref *Model, cfg DPOConfig, logf func(TrainMetrics)) (float64, WindowReport, error) {
+	report := newWindowReport(m.Config.Context)
 	cfg.Normalize()
 	if cfg.MaxSteps < 0 || cfg.LearningRate <= 0 {
-		return 0, fmt.Errorf("invalid DPO config")
+		return 0, report, fmt.Errorf("invalid DPO config")
 	}
 	if len(pairs) == 0 {
-		return 0, fmt.Errorf("preference pairs required")
+		return 0, report, fmt.Errorf("preference pairs required")
 	}
 	if ref == nil {
-		return 0, fmt.Errorf("reference model required")
+		return 0, report, fmt.Errorf("reference model required")
 	}
 	if ref.Tokenizer != m.Tokenizer && TokenizerFingerprint(ref.Tokenizer) != TokenizerFingerprint(m.Tokenizer) {
-		return 0, fmt.Errorf("reference model tokenizer does not match policy")
+		return 0, report, fmt.Errorf("reference model tokenizer does not match policy")
 	}
 
 	data := make([]dpoPairData, 0, len(pairs))
 	for _, p := range pairs {
+		report.Examples++
 		d, err := m.prepareDPOPair(p, ref)
 		if err != nil {
+			report.drop(err)
 			continue
 		}
+		report.retain(int64(len(d.chosen.input)+len(d.rejected.input)+2),
+			int64(d.chosen.active+d.rejected.active), d.trimmed)
 		data = append(data, d)
 	}
 	if len(data) == 0 {
-		return 0, fmt.Errorf("no usable preference pairs within context length")
+		return 0, report, fmt.Errorf("no usable preference pairs within context length (%d dropped: %s)",
+			report.Dropped, report.DropSummary())
 	}
 
-	m.backend = nil
+	m.invalidateBackend()
 	rng := rand.New(rand.NewSource(cfg.Seed))
 	var totalLoss float64
 	var steps int64
@@ -332,7 +350,7 @@ func (m *Model) TrainDPO(pairs []PreferencePair, ref *Model, cfg DPOConfig, logf
 		}
 	}
 	if steps == 0 {
-		return 0, fmt.Errorf("no training steps completed")
+		return 0, report, fmt.Errorf("no training steps completed")
 	}
-	return totalLoss / float64(steps), nil
+	return totalLoss / float64(steps), report, nil
 }
