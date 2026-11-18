@@ -403,7 +403,15 @@ func (b *cudaInferenceBackend) NewKVCache() *kvCache {
 }
 
 // ensureKV grows a layer's device K/V cache to hold at least `rows` tokens.
+// The byte size is validated before allocating: a non-positive shape or an
+// overflowing product must not reach cudaMalloc.
 func ensureKV(layer *kvLayerCache, width, rows int) error {
+	if width <= 0 || rows <= 0 {
+		return fmt.Errorf("kv cache growth: invalid width=%d rows=%d", width, rows)
+	}
+	if rows > math.MaxInt/(width*4) {
+		return fmt.Errorf("kv cache growth: %d rows of width %d overflow the byte size", rows, width)
+	}
 	need := rows * width * 4
 	if layer.dk != nil && layer.dk.Bytes() >= need {
 		return nil
@@ -464,6 +472,24 @@ func (b *cudaInferenceBackend) ForwardStepKV(tokenID int, pos int, cache *kvCach
 
 	if tokenID < 0 || tokenID >= b.vocab {
 		tokenID = 0
+	}
+
+	// Positions outside the context would size device buffers directly from
+	// caller input, so they are served by the CPU reference path, which
+	// allocates no device memory, and this cache stops using the GPU.
+	if pos < 0 || pos >= b.config.Context {
+		cache.cpuOnly = true
+		return forwardStepKV(b.config, b.vocab, b.host, tokenID, pos, cache)
+	}
+
+	// The device cache is written at pos*width, so the host mirror must hold
+	// exactly pos rows per layer first; a cache missing or repeating positions
+	// would silently misplace the new K/V rows.
+	for i := range cache.layers {
+		if got := len(cache.layers[i].k) / width; got != pos {
+			cache.cpuOnly = true
+			return forwardStepKV(b.config, b.vocab, b.host, tokenID, pos, cache)
+		}
 	}
 
 	// Pre-allocate device KV caches for every layer before mutating state.

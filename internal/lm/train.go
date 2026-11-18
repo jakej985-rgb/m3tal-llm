@@ -132,7 +132,7 @@ func (m *Model) TrainStream(ts WindowSource, cfg TrainConfig, logf func(TrainMet
 	if ts == nil {
 		return 0, fmt.Errorf("token stream is required")
 	}
-	m.backend = nil
+	m.invalidateBackend()
 	context := m.Config.Context
 	var totalLoss float64
 	var windows, tokensSeen int64
