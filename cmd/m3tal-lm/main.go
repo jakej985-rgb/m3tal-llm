@@ -478,12 +478,14 @@ func run(args []string) error {
 		return chatEval(args[1:])
 	case "serve":
 		return serveLLM(args[1:])
+	case "chat":
+		return interactiveChat(args[1:])
 	case "model-card":
 		return modelCard(args[1:])
 	case "package":
 		return packageModel(args[1:])
 	default:
-		return fmt.Errorf("unknown command %q; use train, eval, generate, instructions, dataset, chatdata, chat-eval, migrate, serve, model-card, package, backends, or model-info", args[0])
+		return fmt.Errorf("unknown command %q; use train, eval, generate, instructions, dataset, chat, chatdata, chat-eval, migrate, serve, model-card, package, backends, or model-info", args[0])
 	}
 }
 
@@ -1607,6 +1609,114 @@ func writeTarGz(path string, files map[string]string) error {
 		}
 		if _, err := tw.Write([]byte(data)); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// interactiveChat provides an interactive multi-turn REPL directly in the terminal.
+func interactiveChat(args []string) error {
+	flags := flag.NewFlagSet("chat", flag.ContinueOnError)
+	checkpoint := flags.String("checkpoint", "models/m3tal-smart-6m.json", "model checkpoint path")
+	maxTokens := flags.Int("tokens", 128, "maximum output tokens per response")
+	temperature := flags.Float64("temperature", 0.2, "sampling temperature")
+	systemPrompt := flags.String("system", "You are M3TAL AI, a thoughtful, concise assistant for the M3TAL ecosystem.", "system prompt")
+	seed := flags.Int64("seed", 42, "sampling seed")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	model, err := lm.LoadCheckpoint(*checkpoint)
+	if err != nil {
+		return fmt.Errorf("load checkpoint: %w", err)
+	}
+
+	fmt.Printf("\n=== M3TAL Pure-Go LLM Interactive Chat ===\n")
+	fmt.Printf("Model: %s (%d parameters, context %d, vocab %d)\n",
+		filepath.Base(*checkpoint), model.ParameterCount(), model.Config.Context, len(model.Tokenizer.Tokens))
+	fmt.Println("Type your message and press Enter. Commands: /reset (clear history), /exit (quit).")
+	fmt.Println("--------------------------------------------------------------------------------")
+
+	conv := lm.Conversation{}
+	if strings.TrimSpace(*systemPrompt) != "" {
+		conv.Messages = append(conv.Messages, lm.ChatMessage{
+			Role:    lm.RoleSystem,
+			Content: *systemPrompt,
+		})
+	}
+
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		fmt.Print("\nuser> ")
+		line, err := reader.ReadString('\n')
+		if err != nil && line == "" {
+			break
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if line == "/exit" || line == "/quit" || line == "exit" || line == "quit" {
+			fmt.Println("Goodbye.")
+			break
+		}
+		if line == "/reset" {
+			conv.Messages = nil
+			if strings.TrimSpace(*systemPrompt) != "" {
+				conv.Messages = append(conv.Messages, lm.ChatMessage{
+					Role:    lm.RoleSystem,
+					Content: *systemPrompt,
+				})
+			}
+			fmt.Println("[Conversation history cleared]")
+			continue
+		}
+
+		conv.Messages = append(conv.Messages, lm.ChatMessage{
+			Role:    lm.RoleUser,
+			Content: line,
+		})
+
+		// Sliding window if conversation exceeds context tokens
+		for len(conv.Messages) > 2 {
+			tokens := conv.EncodePrompt(model.Tokenizer)
+			if len(tokens) <= model.Config.Context-32 {
+				break
+			}
+			// Keep system message if present, drop oldest user/assistant turn
+			if conv.Messages[0].Role == lm.RoleSystem {
+				if len(conv.Messages) > 3 {
+					conv.Messages = append([]lm.ChatMessage{conv.Messages[0]}, conv.Messages[3:]...)
+				} else {
+					break
+				}
+			} else {
+				conv.Messages = conv.Messages[2:]
+			}
+		}
+
+		promptText := model.Tokenizer.Decode(conv.EncodePrompt(model.Tokenizer))
+		opts := lm.GenerateOptions{
+			MaxTokens:   *maxTokens,
+			Temperature: *temperature,
+			Seed:        *seed,
+			Stop:        lm.StopMarkers(),
+		}
+
+		fmt.Print("assistant> ")
+		var fullReply strings.Builder
+		_, genErr := model.GenerateStream(promptText, opts, func(delta string) error {
+			fmt.Print(delta)
+			fullReply.WriteString(delta)
+			return nil
+		})
+		fmt.Println()
+		if genErr != nil {
+			fmt.Fprintf(os.Stderr, "[Generation error: %v]\n", genErr)
+		} else {
+			conv.Messages = append(conv.Messages, lm.ChatMessage{
+				Role:    lm.RoleAssistant,
+				Content: fullReply.String(),
+			})
 		}
 	}
 	return nil
