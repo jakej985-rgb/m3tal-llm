@@ -15,22 +15,34 @@ func main() {
 	width := flag.Int("width", 256, "model width")
 	layers := flag.Int("layers", 4, "transformer layers")
 	heads := flag.Int("heads", 8, "attention heads")
-	vocab := flag.Int("vocab", 512, "tokenizer vocab size")
+	vocab := flag.Int("vocab", 512, "tokenizer vocab size (if training fresh tokenizer)")
+	tokPath := flag.String("tokenizer", "", "path to existing tokenizer artifact JSON")
 	seed := flag.Int64("seed", 17, "init seed")
 	flag.Parse()
 	if *out == "" {
 		fmt.Fprintln(os.Stderr, "-out required")
 		os.Exit(2)
 	}
-	data, err := os.ReadFile("data/instructions.txt")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	tok, err := lm.TrainTokenizer([]string{string(data)}, *vocab)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+
+	var tok *lm.Tokenizer
+	if *tokPath != "" {
+		var err error
+		tok, err = lm.LoadTokenizer(*tokPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load tokenizer %s: %v\n", *tokPath, err)
+			os.Exit(1)
+		}
+	} else {
+		data, err := os.ReadFile("data/instructions.txt")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		tok, err = lm.TrainTokenizer([]string{string(data)}, *vocab)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	}
 	m, err := lm.NewModel(lm.Config{Context: *context, Width: *width, Layers: *layers, Heads: *heads}, tok, *seed)
 	if err != nil {

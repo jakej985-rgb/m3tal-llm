@@ -11,6 +11,7 @@
 package lm
 
 import (
+	"container/heap"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -41,6 +42,45 @@ type Tokenizer struct {
 	SpecialTokens map[string]int `json:"special_tokens,omitempty"`
 	unkTokenID    int
 	index         map[string]int
+
+	// Encoding fast path, rebuilt by reindex: mergeIndex maps an adjacent
+	// (left, right) token-id pair to its merge rule, and byteIDs maps a raw
+	// byte to its token id. hasByteIDs is false for tokenizers that do not
+	// start with the 256 byte tokens, which fall back to the reference path.
+	mergeIndex map[uint64]bpeRule
+	byteIDs    [256]int32
+	hasByteIDs bool
+}
+
+// bpeRule is one learned merge: its rank (position in the merge list, i.e.
+// learned order) and the token id it produces.
+type bpeRule struct {
+	rank uint32
+	out  int32
+}
+
+func mergeKey(left, right int32) uint64 {
+	return uint64(uint32(left))<<32 | uint64(uint32(right))
+}
+
+// bpeQueue is a min-heap of packed (rank, position) pairs. Ordering by rank
+// then position reproduces "replay merges in learned order, left to right".
+type bpeQueue []uint64
+
+func (q bpeQueue) Len() int           { return len(q) }
+func (q bpeQueue) Less(i, j int) bool { return q[i] < q[j] }
+func (q bpeQueue) Swap(i, j int)      { q[i], q[j] = q[j], q[i] }
+func (q *bpeQueue) Push(x any)        { *q = append(*q, x.(uint64)) }
+func (q *bpeQueue) Pop() any {
+	old := *q
+	n := len(old)
+	item := old[n-1]
+	*q = old[:n-1]
+	return item
+}
+
+func packPair(rank uint32, pos int32) uint64 {
+	return uint64(rank)<<32 | uint64(uint32(pos))
 }
 
 // Merge records one ordered byte-pair merge.
@@ -145,70 +185,233 @@ func TrainTokenizerWithOptions(corpus []string, cfg TokenizerConfig) (*Tokenizer
 
 	// 3. Prepare sequences for BPE merge training.
 	// Sequences are split so special tokens do not get merged with regular text.
-	sequences := make([][]string, 0, len(corpus))
+	// Symbols are token ids; the initial 256 byte tokens hold ids 0..255, so a
+	// raw byte is its own id until the first merge creates a new token.
+	sequences := make([][]int32, 0, len(corpus))
 	for _, text := range corpus {
 		subTexts := t.splitSpecialTokens(text)
 		for _, chunk := range subTexts {
-			if !chunk.isSpecial && len(chunk.text) > 0 {
-				sequences = append(sequences, byteSymbols(chunk.text))
+			if chunk.isSpecial || len(chunk.text) == 0 {
+				continue
 			}
+			seq := make([]int32, len(chunk.text))
+			for i := 0; i < len(chunk.text); i++ {
+				seq[i] = int32(chunk.text[i])
+			}
+			sequences = append(sequences, seq)
 		}
 	}
 
-	// 4. Learn BPE merges up to targetSize
-	for len(t.Tokens) < targetSize {
-		counts := make(map[pair]int)
-		for _, seq := range sequences {
-			for i := 0; i+1 < len(seq); i++ {
-				candidate := pair{seq[i], seq[i+1]}
-				if !known[candidate.left+candidate.right] {
-					counts[candidate]++
-				}
-			}
-		}
-		best := pair{}
-		keys := make([]pair, 0, len(counts))
-		for candidate, count := range counts {
-			if count > 1 {
-				keys = append(keys, candidate)
-			}
-		}
-		if len(keys) == 0 {
-			break
-		}
-		sort.Slice(keys, func(i, j int) bool {
-			if keys[i].left == keys[j].left {
-				return keys[i].right < keys[j].right
-			}
-			return keys[i].left < keys[j].left
-		})
-		// The sorted tie-break is stable and independent of map iteration order.
-		maxCount := 0
-		for _, candidate := range keys {
-			if counts[candidate] > maxCount {
-				maxCount = counts[candidate]
-			}
-		}
-		for _, candidate := range keys {
-			if counts[candidate] == maxCount {
-				best = candidate
-				break
-			}
-		}
-		merged := best.left + best.right
-		known[merged] = true
-		t.Merges = append(t.Merges, Merge{Left: best.left, Right: best.right, Token: merged})
-		t.Tokens = append(t.Tokens, merged)
-		for i, seq := range sequences {
-			sequences[i] = applyMerge(seq, best.left, best.right, merged)
-		}
-	}
+	// The merge loop resolves token strings to ids through the index, so build
+	// it before learning merges (reindex also runs again on the final vocab).
+	t.reindex()
+
+	// 4. Learn BPE merges up to targetSize.
+	t.trainMerges(sequences, targetSize)
 
 	t.reindex()
 	return t, nil
 }
 
-type pair struct{ left, right string }
+// pairItem is one merge candidate: an adjacent-pair key and its occurrence
+// count. Keys are compared by count, then by the pair's token strings, which
+// is the tie-break the previous full-sort implementation used.
+type pairItem struct {
+	count int
+	key   uint64
+}
+
+// pairQueue is a max-heap of merge candidates. Counts change as merges are
+// applied, so entries go stale; best discards or refreshes them on pop, and
+// rebuild bounds the number of stale entries.
+type pairQueue struct {
+	tokens []string
+	items  []pairItem
+}
+
+func (q *pairQueue) Len() int { return len(q.items) }
+
+func (q *pairQueue) Less(i, j int) bool {
+	a, b := q.items[i], q.items[j]
+	if a.count != b.count {
+		return a.count > b.count
+	}
+	leftA, rightA := q.tokens[uint32(a.key>>32)], q.tokens[uint32(a.key)]
+	leftB, rightB := q.tokens[uint32(b.key>>32)], q.tokens[uint32(b.key)]
+	if leftA != leftB {
+		return leftA < leftB
+	}
+	return rightA < rightB
+}
+
+func (q *pairQueue) Swap(i, j int) { q.items[i], q.items[j] = q.items[j], q.items[i] }
+func (q *pairQueue) Push(x any)    { q.items = append(q.items, x.(pairItem)) }
+
+func (q *pairQueue) Pop() any {
+	old := q.items
+	n := len(old)
+	item := old[n-1]
+	q.items = old[:n-1]
+	return item
+}
+
+// increment records one new occurrence of a pair.
+func (q *pairQueue) increment(key uint64, counts map[uint64]int, blocked map[uint64]bool) {
+	counts[key]++
+	if counts[key] >= 2 && !blocked[key] {
+		heap.Push(q, pairItem{count: counts[key], key: key})
+	}
+}
+
+// best returns the merge to apply next: the highest count above one, ties
+// broken by the smallest (left, right) token strings.
+func (q *pairQueue) best(counts map[uint64]int, blocked map[uint64]bool) (pairItem, bool) {
+	for q.Len() > 0 {
+		item := heap.Pop(q).(pairItem)
+		count := counts[item.key]
+		if count != item.count {
+			// Stale entry: the pair gained or lost occurrences since it was
+			// pushed. Re-file it under its current count.
+			if count >= 2 && !blocked[item.key] {
+				heap.Push(q, pairItem{count: count, key: item.key})
+			}
+			continue
+		}
+		if count < 2 || blocked[item.key] {
+			continue
+		}
+		return item, true
+	}
+	return pairItem{}, false
+}
+
+// rebuild drops stale entries so the queue stays proportional to live pairs.
+func (q *pairQueue) rebuild(counts map[uint64]int, blocked map[uint64]bool) {
+	q.items = q.items[:0]
+	for key, count := range counts {
+		if count >= 2 && !blocked[key] {
+			q.items = append(q.items, pairItem{count: count, key: key})
+		}
+	}
+	heap.Init(q)
+}
+
+// markBlockedSplits blocks every pair whose concatenation is already a token.
+// A string can be tokenized more than one way ("ab"+"c" and "a"+"bc"), and
+// the previous implementation never counted such a pair, so neither does this
+// one. Splits of a newly created token are the only pairs that can become
+// blocked later, because token ids are never removed.
+func (t *Tokenizer) markBlockedSplits(token string, blocked map[uint64]bool) {
+	for i := 1; i < len(token); i++ {
+		left, leftOK := t.index[token[:i]]
+		right, rightOK := t.index[token[i:]]
+		if leftOK && rightOK {
+			blocked[mergeKey(int32(left), int32(right))] = true
+		}
+	}
+}
+
+// trainMerges learns merge rules until the vocabulary reaches targetSize.
+//
+// Pair counts are seeded with one corpus scan and then adjusted only around
+// the occurrences each merge replaces, so learning is linear in the corpus
+// plus the work of the merges themselves instead of a full rescan (with a
+// string-keyed map and a sort of every distinct pair) per merge. The merge
+// chosen is identical to that rescan, including tie-breaking, so existing
+// vocabularies and artifacts are unaffected.
+func (t *Tokenizer) trainMerges(sequences [][]int32, targetSize int) {
+	counts := make(map[uint64]int, 1<<14)
+	blocked := make(map[uint64]bool)
+	for _, token := range t.Tokens {
+		t.markBlockedSplits(token, blocked)
+	}
+
+	// Seeding: every symbol is still a raw byte id (< 256), so the counts fit
+	// in a dense table before the first merge.
+	var seedCounts [1 << 16]int32
+	for _, seq := range sequences {
+		for i := 0; i+1 < len(seq); i++ {
+			seedCounts[int(seq[i])<<8|int(seq[i+1])]++
+		}
+	}
+	queue := &pairQueue{tokens: t.Tokens}
+	for k, count := range seedCounts {
+		if count < 2 {
+			continue
+		}
+		key := mergeKey(int32(k>>8), int32(k&0xff))
+		counts[key] = int(count)
+		if !blocked[key] {
+			queue.items = append(queue.items, pairItem{count: int(count), key: key})
+		}
+	}
+	heap.Init(queue)
+
+	for len(t.Tokens) < targetSize {
+		item, ok := queue.best(counts, blocked)
+		if !ok {
+			break
+		}
+		left, right := int32(uint32(item.key>>32)), int32(uint32(item.key))
+		merged := t.Tokens[left] + t.Tokens[right]
+		t.Merges = append(t.Merges, Merge{Left: t.Tokens[left], Right: t.Tokens[right], Token: merged})
+		t.Tokens = append(t.Tokens, merged)
+		queue.tokens = t.Tokens // append may have moved the backing array
+		id := int32(len(t.Tokens) - 1)
+		t.index[merged] = int(id)
+		t.markBlockedSplits(merged, blocked)
+		t.applyMergeEverywhere(sequences, left, right, id, counts, blocked, queue)
+		if queue.Len() > 4*len(counts)+1024 {
+			queue.rebuild(counts, blocked)
+		}
+	}
+}
+
+// applyMergeEverywhere replaces every non-overlapping occurrence of the pair,
+// scanning each sequence left to right like applyMerge, and keeps pair counts
+// in step: a replacement at ... prev, left, right, next ... removes (prev,
+// left), (left, right) and (right, next) and adds (prev, merged) and (merged,
+// next). Pairs that the untouched remainder of the sequence forms are already
+// counted, and (merged, next) is added here even when next is itself merged
+// away later in this pass, which that merge then removes again.
+func (t *Tokenizer) applyMergeEverywhere(sequences [][]int32, left, right, merged int32, counts map[uint64]int, blocked map[uint64]bool, queue *pairQueue) {
+	for s := range sequences {
+		seq := sequences[s]
+		n := 0
+		for i := 0; i < len(seq); {
+			if i+1 < len(seq) && seq[i] == left && seq[i+1] == right {
+				prev, next := int32(-1), int32(-1)
+				if n > 0 {
+					prev = seq[n-1]
+				}
+				if i+2 < len(seq) {
+					next = seq[i+2]
+				}
+				if prev >= 0 {
+					counts[mergeKey(prev, left)]--
+				}
+				counts[mergeKey(left, right)]--
+				if next >= 0 {
+					counts[mergeKey(right, next)]--
+				}
+				if prev >= 0 {
+					queue.increment(mergeKey(prev, merged), counts, blocked)
+				}
+				if next >= 0 {
+					queue.increment(mergeKey(merged, next), counts, blocked)
+				}
+				seq[n] = merged
+				n++
+				i += 2
+				continue
+			}
+			seq[n] = seq[i]
+			n++
+			i++
+		}
+		sequences[s] = seq[:n]
+	}
+}
 
 func byteSymbols(text string) []string {
 	out := make([]string, len([]byte(text)))
@@ -250,6 +453,31 @@ func (t *Tokenizer) reindex() {
 	t.index = make(map[string]int, len(t.Tokens))
 	for id, token := range t.Tokens {
 		t.index[token] = id
+	}
+	t.mergeIndex = make(map[uint64]bpeRule, len(t.Merges))
+	for rank, merge := range t.Merges {
+		left, leftOK := t.index[merge.Left]
+		right, rightOK := t.index[merge.Right]
+		out, outOK := t.index[merge.Token]
+		if !leftOK || !rightOK || !outOK {
+			continue
+		}
+		key := mergeKey(int32(left), int32(right))
+		if _, exists := t.mergeIndex[key]; exists {
+			// Keep the earliest rule for a pair, matching replay order.
+			continue
+		}
+		t.mergeIndex[key] = bpeRule{rank: uint32(rank), out: int32(out)}
+	}
+	t.hasByteIDs = true
+	t.byteIDs = [256]int32{}
+	for b := 0; b < 256; b++ {
+		id, ok := t.index[string([]byte{byte(b)})]
+		if !ok {
+			t.hasByteIDs = false
+			break
+		}
+		t.byteIDs[b] = int32(id)
 	}
 }
 
@@ -342,17 +570,94 @@ func (t *Tokenizer) Encode(text string) []int {
 			ids = append(ids, chunk.id)
 			continue
 		}
+		ids = append(ids, t.encodeChunk(chunk.text)...)
+	}
+	return ids
+}
 
-		seq := byteSymbols(chunk.text)
-		for _, merge := range t.Merges {
-			seq = applyMerge(seq, merge.Left, merge.Right, merge.Token)
+// encodeChunk tokenizes one non-special chunk.
+func (t *Tokenizer) encodeChunk(text string) []int {
+	if !t.hasByteIDs {
+		// Tokenizer without the 256 byte tokens: the reference path is the
+		// only correct one (it can also emit the unknown token).
+		return t.encodeChunkSlow(text)
+	}
+	n := len(text)
+	if n == 0 {
+		return nil
+	}
+	// tokens holds each node's current token id; a merged-away node is
+	// marked -1, which no rule can match because token ids are >= 0.
+	tokens := make([]int32, n)
+	prev := make([]int32, n)
+	next := make([]int32, n)
+	for i := 0; i < n; i++ {
+		tokens[i] = t.byteIDs[text[i]]
+		prev[i] = int32(i - 1)
+		next[i] = int32(i + 1)
+	}
+	next[n-1] = -1
+	queue := make(bpeQueue, 0, n)
+	for i := 0; i+1 < n; i++ {
+		if rule, ok := t.mergeIndex[mergeKey(tokens[i], tokens[i+1])]; ok {
+			queue = append(queue, packPair(rule.rank, int32(i)))
 		}
-		for _, token := range seq {
-			if id, ok := t.index[token]; ok {
-				ids = append(ids, id)
-			} else if t.unkTokenID >= 0 {
-				ids = append(ids, t.unkTokenID)
+	}
+	heap.Init(&queue)
+
+	for queue.Len() > 0 {
+		item := heap.Pop(&queue).(uint64)
+		rank := uint32(item >> 32)
+		pos := int32(uint32(item))
+		right := next[pos]
+		if tokens[pos] < 0 || right < 0 || tokens[right] < 0 {
+			continue // node already merged away
+		}
+		rule, ok := t.mergeIndex[mergeKey(tokens[pos], tokens[right])]
+		if !ok || rule.rank != rank {
+			// Stale entry: a neighbouring merge changed this pair.
+			continue
+		}
+		tokens[pos] = rule.out
+		tokens[right] = -1
+		next[pos] = next[right]
+		if next[right] >= 0 {
+			prev[next[right]] = pos
+		}
+		if right := next[pos]; right >= 0 {
+			if rule, ok := t.mergeIndex[mergeKey(tokens[pos], tokens[right])]; ok {
+				heap.Push(&queue, packPair(rule.rank, pos))
 			}
+		}
+		if left := prev[pos]; left >= 0 {
+			if rule, ok := t.mergeIndex[mergeKey(tokens[left], tokens[pos])]; ok {
+				heap.Push(&queue, packPair(rule.rank, left))
+			}
+		}
+	}
+
+	ids := make([]int, 0, n)
+	for i := int32(0); i >= 0; i = next[i] {
+		ids = append(ids, int(tokens[i]))
+	}
+	return ids
+}
+
+// encodeChunkSlow is the original implementation: replay every merge in
+// learned order over the whole symbol sequence. It is kept as the fallback
+// for tokenizers without the 256 byte tokens, where byte ids cannot be
+// mapped directly (and where unknown tokens may apply).
+func (t *Tokenizer) encodeChunkSlow(text string) []int {
+	seq := byteSymbols(text)
+	for _, merge := range t.Merges {
+		seq = applyMerge(seq, merge.Left, merge.Right, merge.Token)
+	}
+	ids := make([]int, 0, len(seq))
+	for _, token := range seq {
+		if id, ok := t.index[token]; ok {
+			ids = append(ids, id)
+		} else if t.unkTokenID >= 0 {
+			ids = append(ids, t.unkTokenID)
 		}
 	}
 	return ids
