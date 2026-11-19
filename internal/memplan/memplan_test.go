@@ -1,0 +1,366 @@
+package memplan
+
+import (
+	"errors"
+	"math"
+	"testing"
+)
+
+// fakeProvider stands in for a device memory query in tests.
+type fakeProvider struct {
+	available int64
+	err       error
+}
+
+func (f *fakeProvider) AvailableBytes() (int64, error) {
+	return f.available, f.err
+}
+
+// testConfig has hand-checkable numbers: 1000 params, 2 layers, width 8,
+// 2 heads, vocab 16, fp32, no headroom.
+//
+//	weights  1000*4                                      = 4000
+//	kv       2*2 layers*1*4 tokens*8 width*4             =  512
+//	scratch  (1*4*8*24 + 1*4*16 + 1*2*4*4)*4            = 3456
+//	total                                                = 7968
+func testConfig() Config {
+	return Config{
+		Parameters:       1000,
+		Layers:           2,
+		Width:            8,
+		Heads:            2,
+		Vocab:            16,
+		WeightDType:      F32,
+		KVDType:          F32,
+		ActivationDType:  F32,
+		HeadroomFraction: -1, // disabled for exact arithmetic
+	}
+}
+
+func testRequest(batch, context int) Request {
+	cfg := testConfig()
+	return Request{Config: cfg, Batch: batch, ContextTokens: context}
+}
+
+func TestEstimateComponents(t *testing.T) {
+	got, err := Estimate(testRequest(1, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Requirements{
+		WeightsBytes: 4000,
+		KVCacheBytes: 512,
+		ScratchBytes: 3456,
+		TotalBytes:   7968,
+	}
+	if got != want {
+		t.Fatalf("Estimate = %+v, want %+v", got, want)
+	}
+}
+
+func TestEstimateHeadroom(t *testing.T) {
+	cfg := testConfig()
+	cfg.HeadroomFraction = 0.10
+	got, err := Estimate(Request{Config: cfg, Batch: 1, ContextTokens: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.HeadroomBytes != 797 { // ceil(7968 * 0.10)
+		t.Fatalf("headroom = %d, want 797", got.HeadroomBytes)
+	}
+	if got.TotalBytes != 8765 {
+		t.Fatalf("total = %d, want 8765", got.TotalBytes)
+	}
+}
+
+func TestEstimateDefaultsHeadroomWhenUnset(t *testing.T) {
+	cfg := testConfig()
+	cfg.HeadroomFraction = 0 // select the default 10%
+	got, err := Estimate(Request{Config: cfg, Batch: 1, ContextTokens: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.HeadroomBytes != 797 {
+		t.Fatalf("default headroom = %d, want 797", got.HeadroomBytes)
+	}
+}
+
+func TestEstimateQuantizedWeights(t *testing.T) {
+	tests := []struct {
+		name         string
+		dtype        DType
+		group        int
+		zeroPointBit int
+		wantWeights  int64
+		wantMetadata int64
+	}{
+		// 1000 int8 weights = 1000 bytes; 8 groups (ceil 1000/128) of fp16
+		// scale = 16 bytes.
+		{name: "int8 grouped", dtype: INT8, group: 128, wantWeights: 1000, wantMetadata: 16},
+		// 1000 int4 weights = 500 bytes; same 8-group metadata.
+		{name: "int4 grouped", dtype: INT4, group: 128, wantWeights: 500, wantMetadata: 16},
+		// Asymmetric: 4 extra zero-point bits per group -> 20 bits * 8 = 20 bytes.
+		{name: "int4 asymmetric", dtype: INT4, group: 128, zeroPointBit: 4, wantWeights: 500, wantMetadata: 20},
+		// With no group size, INT8 uses one per-tensor scale (2 bytes).
+		{name: "int8 per-tensor", dtype: INT8, group: 0, wantWeights: 1000, wantMetadata: 2},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.WeightDType = tc.dtype
+			cfg.QuantGroupSize = tc.group
+			cfg.ZeroPointBits = tc.zeroPointBit
+			got, err := Estimate(Request{Config: cfg, Batch: 1, ContextTokens: 4})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.WeightsBytes != tc.wantWeights {
+				t.Fatalf("weights = %d, want %d", got.WeightsBytes, tc.wantWeights)
+			}
+			if got.QuantMetadataBytes != tc.wantMetadata {
+				t.Fatalf("metadata = %d, want %d", got.QuantMetadataBytes, tc.wantMetadata)
+			}
+		})
+	}
+}
+
+func TestEstimateFloatWeightsHaveNoQuantMetadata(t *testing.T) {
+	cfg := testConfig()
+	cfg.QuantGroupSize = 128
+	cfg.WeightDType = F16
+	got, err := Estimate(Request{Config: cfg, Batch: 1, ContextTokens: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.QuantMetadataBytes != 0 {
+		t.Fatalf("metadata = %d, want 0 for float weights", got.QuantMetadataBytes)
+	}
+	if got.WeightsBytes != 2000 {
+		t.Fatalf("weights = %d, want 2000", got.WeightsBytes)
+	}
+}
+
+func TestEstimateRejectsInvalidConfig(t *testing.T) {
+	tests := []struct {
+		name   string
+		req    Request
+		target error
+	}{
+		{name: "zero layers", req: Request{Config: Config{Parameters: 1, Width: 8, Heads: 2, Vocab: 16}, Batch: 1, ContextTokens: 1}, target: ErrInvalidConfig},
+		{name: "unknown weight dtype", req: Request{Config: Config{Parameters: 1, Layers: 1, Width: 8, Heads: 2, Vocab: 16, WeightDType: DType(99)}, Batch: 1, ContextTokens: 1}, target: ErrInvalidConfig},
+		{name: "zero batch", req: Request{Config: testConfig(), Batch: 0, ContextTokens: 1}, target: ErrInvalidConfig},
+		{name: "zero context", req: Request{Config: testConfig(), Batch: 1, ContextTokens: 0}, target: ErrInvalidConfig},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := Estimate(tc.req); !errors.Is(err, tc.target) {
+				t.Fatalf("err = %v, want %v", err, tc.target)
+			}
+		})
+	}
+}
+
+func TestEstimateOverflow(t *testing.T) {
+	cfg := testConfig()
+	cfg.Parameters = math.MaxInt64
+	_, err := Estimate(Request{Config: cfg, Batch: 1, ContextTokens: 1})
+	if !errors.Is(err, ErrOverflow) {
+		t.Fatalf("err = %v, want ErrOverflow", err)
+	}
+}
+
+func TestEstimateKVScalesWithContext(t *testing.T) {
+	short, err := Estimate(testRequest(1, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	long, err := Estimate(testRequest(1, 8))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if long.KVCacheBytes != 2*short.KVCacheBytes {
+		t.Fatalf("kv at ctx8 = %d, want 2x ctx4 (%d)", long.KVCacheBytes, short.KVCacheBytes)
+	}
+}
+
+func TestPlanFitsAsRequested(t *testing.T) {
+	req := testRequest(1, 4)
+	decision, err := Plan(req, Limits{Provider: &fakeProvider{available: 7968}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.ReducedBatch || decision.ReducedContext || decision.Advisory {
+		t.Fatalf("unexpected reduction/advisory: %+v", decision)
+	}
+	if decision.Source != SourceProvider {
+		t.Fatalf("source = %q, want provider", decision.Source)
+	}
+	if decision.Admitted != req {
+		t.Fatalf("admitted = %+v, want requested", decision.Admitted)
+	}
+	if decision.AvailableBytes != 7968 {
+		t.Fatalf("available = %d, want 7968", decision.AvailableBytes)
+	}
+}
+
+func TestPlanBoundaryOneByteShortReducesContext(t *testing.T) {
+	decision, err := Plan(testRequest(1, 4), Limits{Provider: &fakeProvider{available: 7967}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decision.ReducedContext {
+		t.Fatal("expected the context to be reduced by one byte short")
+	}
+	if decision.ReducedBatch {
+		t.Fatal("batch should not change for a batch-1 request")
+	}
+	if decision.Admitted.ContextTokens != 3 {
+		t.Fatalf("admitted context = %d, want 3 (largest that fits)", decision.Admitted.ContextTokens)
+	}
+	if decision.Requirements.TotalBytes > decision.AvailableBytes {
+		t.Fatalf("admitted %d bytes > available %d", decision.Requirements.TotalBytes, decision.AvailableBytes)
+	}
+	if decision.RequestedRequirements.TotalBytes != 7968 {
+		t.Fatalf("requested requirements = %d, want 7968 preserved", decision.RequestedRequirements.TotalBytes)
+	}
+}
+
+func TestPlanReducesBatchBeforeContext(t *testing.T) {
+	req := testRequest(2, 4) // 11936 bytes
+	decision, err := Plan(req, Limits{Provider: &fakeProvider{available: 8000}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decision.ReducedBatch {
+		t.Fatal("expected batch reduction")
+	}
+	if decision.ReducedContext {
+		t.Fatal("context should stay at 4 when batch 1 fits")
+	}
+	if decision.Admitted.Batch != 1 || decision.Admitted.ContextTokens != 4 {
+		t.Fatalf("admitted = %+v, want batch 1 context 4", decision.Admitted)
+	}
+	if decision.Requirements.TotalBytes != 7968 {
+		t.Fatalf("admitted requirements = %d, want 7968", decision.Requirements.TotalBytes)
+	}
+}
+
+func TestPlanLowMemoryRefuses(t *testing.T) {
+	decision, err := Plan(testRequest(1, 4), Limits{Provider: &fakeProvider{available: 1000}})
+	if !errors.Is(err, ErrInsufficientMemory) {
+		t.Fatalf("err = %v, want ErrInsufficientMemory", err)
+	}
+	if decision.Admitted.ContextTokens != 1 {
+		t.Fatalf("admitted context = %d, want the minimum of 1", decision.Admitted.ContextTokens)
+	}
+	if decision.Requirements.TotalBytes != 4968 {
+		t.Fatalf("minimum requirements = %d, want 4968", decision.Requirements.TotalBytes)
+	}
+	if decision.AvailableBytes != 1000 {
+		t.Fatalf("available = %d, want 1000", decision.AvailableBytes)
+	}
+}
+
+func TestPlanHonorsMinimumContext(t *testing.T) {
+	// Context 2 fits in 6000 bytes, but the caller forbids going below 3.
+	decision, err := Plan(testRequest(1, 4), Limits{
+		Provider:         &fakeProvider{available: 6000},
+		MinContextTokens: 3,
+	})
+	if !errors.Is(err, ErrInsufficientMemory) {
+		t.Fatalf("err = %v, want ErrInsufficientMemory", err)
+	}
+	if decision.Admitted.ContextTokens != 3 {
+		t.Fatalf("admitted context = %d, want 3", decision.Admitted.ContextTokens)
+	}
+	if decision.Requirements.TotalBytes != 6952 {
+		t.Fatalf("requirements = %d, want 6952", decision.Requirements.TotalBytes)
+	}
+}
+
+func TestPlanAdvisoryWhenProviderUnsupported(t *testing.T) {
+	decision, err := Plan(testRequest(2, 8), Limits{
+		Provider: &fakeProvider{err: ErrUnsupported},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decision.Advisory {
+		t.Fatal("expected an advisory plan when availability is unknown")
+	}
+	if decision.Source != SourceUnknown {
+		t.Fatalf("source = %q, want unknown", decision.Source)
+	}
+	if decision.AvailableBytes != -1 {
+		t.Fatalf("available = %d, want -1", decision.AvailableBytes)
+	}
+	if decision.Admitted != decision.Requested {
+		t.Fatal("advisory plan must not reduce the request")
+	}
+	if decision.Requirements != decision.RequestedRequirements {
+		t.Fatal("advisory requirements must match the request")
+	}
+	if !errors.Is(decision.ProviderError, ErrUnsupported) {
+		t.Fatalf("provider error = %v, want ErrUnsupported", decision.ProviderError)
+	}
+}
+
+func TestPlanFallsBackToUserCapOnProviderError(t *testing.T) {
+	req := testRequest(2, 4) // 11936 bytes
+	decision, err := Plan(req, Limits{
+		Provider:     &fakeProvider{err: ErrUnsupported},
+		UserCapBytes: 8000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Advisory {
+		t.Fatal("a user cap must keep the plan enforceable")
+	}
+	if decision.Source != SourceUserCap {
+		t.Fatalf("source = %q, want user_cap", decision.Source)
+	}
+	if !decision.ReducedBatch || decision.Admitted.Batch != 1 {
+		t.Fatalf("admitted = %+v, want a batch-1 plan", decision.Admitted)
+	}
+}
+
+func TestPlanTreatsNegativeAvailabilityAsUnknown(t *testing.T) {
+	decision, err := Plan(testRequest(1, 4), Limits{Provider: &fakeProvider{available: -5}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !decision.Advisory {
+		t.Fatal("expected advisory fallback for an invalid provider value")
+	}
+	if decision.ProviderError == nil {
+		t.Fatal("expected the invalid availability to be recorded")
+	}
+}
+
+func TestPlanUsesStrictestBudget(t *testing.T) {
+	t.Run("user cap is stricter", func(t *testing.T) {
+		decision, err := Plan(testRequest(2, 4), Limits{
+			Provider:     &fakeProvider{available: 100000},
+			UserCapBytes: 8000,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decision.Source != SourceUserCap || decision.AvailableBytes != 8000 {
+			t.Fatalf("source=%q available=%d, want user_cap/8000", decision.Source, decision.AvailableBytes)
+		}
+	})
+	t.Run("provider is stricter", func(t *testing.T) {
+		decision, err := Plan(testRequest(2, 4), Limits{
+			Provider:     &fakeProvider{available: 8000},
+			UserCapBytes: 100000,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decision.Source != SourceProvider || decision.AvailableBytes != 8000 {
+			t.Fatalf("source=%q available=%d, want provider/8000", decision.Source, decision.AvailableBytes)
+		}
+	})
+}
