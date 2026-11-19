@@ -190,11 +190,16 @@ func (m *Model) generateCore(ctx context.Context, prompt string, opts GenerateOp
 		}()
 	}
 
-	// KV-cache prefill.
+	// KV-cache prefill. A cancelled or disconnected request must stop here
+	// instead of paying for a full prompt of forward passes before the first
+	// token-boundary check.
 	kvCache := backend.NewKVCache()
 	defer kvCache.Free()
 	var rawLogits []float32
 	for i, id := range ids {
+		if err := ctx.Err(); err != nil {
+			return string(prefix[genOffset:]), false, err
+		}
 		rawLogits = backend.ForwardStepKV(id, i, kvCache)
 	}
 	pos := len(ids)

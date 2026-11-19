@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -110,6 +111,62 @@ func TestCancelledGenerationLeavesNoGoroutines(t *testing.T) {
 	}
 	if n := settleGoroutines(baseline, 2*time.Second); n > baseline {
 		t.Fatalf("goroutines grew from %d to %d across cancelled generations", baseline, n)
+	}
+}
+
+// countingBackend wraps an inference backend and counts forward calls, so a
+// test can prove that cancelled work never reached the model.
+type countingBackend struct {
+	inferenceBackend
+	steps    int
+	forwards int
+}
+
+func (b *countingBackend) Forward(tokenIDs []int) []float32 {
+	b.forwards++
+	return b.inferenceBackend.Forward(tokenIDs)
+}
+
+func (b *countingBackend) ForwardStepKV(tokenID int, pos int, cache *kvCache) []float32 {
+	b.steps++
+	return b.inferenceBackend.ForwardStepKV(tokenID, pos, cache)
+}
+
+// TestCancelledPromptPerformsNoPrefill checks prompt cancellation: a context
+// cancelled before generation starts must stop before the KV prefill loop, not
+// after prefilling the whole prompt and reaching the first token boundary.
+func TestCancelledPromptPerformsNoPrefill(t *testing.T) {
+	tok, err := TrainTokenizer([]string{"hello world hello there"}, 256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model, err := NewModel(Config{Context: 16, Width: 16, Layers: 1, Heads: 2}, tok, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counter := &countingBackend{inferenceBackend: newCPUInferenceBackend(model)}
+	model.backendMu.Lock()
+	model.backend = counter
+	model.backendMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// Long enough to exceed the 16-token context, so an unguarded prefill
+	// would issue multiple ForwardStepKV calls before noticing cancellation.
+	prompt := strings.Repeat("hello world hello there ", 40)
+	out, err := model.GenerateWithContext(ctx, prompt, GenerateOptions{MaxTokens: 8}, nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if out != "" {
+		t.Fatalf("expected no output before any prefill, got %q", out)
+	}
+	if counter.steps != 0 {
+		t.Fatalf("prefill ran %d ForwardStepKV calls for a cancelled prompt, want 0", counter.steps)
+	}
+	if counter.forwards != 0 {
+		t.Fatalf("fallback forward ran %d times for a cancelled prompt, want 0", counter.forwards)
 	}
 }
 
