@@ -1,11 +1,15 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -189,6 +193,80 @@ func TestChatStreamSSE(t *testing.T) {
 	if !strings.Contains(text, "data: ") || !strings.Contains(text, "[DONE]") {
 		t.Fatalf("bad SSE stream: %q", text)
 	}
+}
+
+// TestChatStreamDisconnectStopsGeneration proves an SSE client disconnect
+// reaches model generation: after the client cancels and closes the stream,
+// the handler must return instead of generating the full output cap. The cap
+// is far larger than can be generated in the wait window, so the handler
+// returning is evidence of cancellation, not of an early finish.
+func TestChatStreamDisconnectStopsGeneration(t *testing.T) {
+	tok := testTokenizer(t)
+	model, err := lm.NewModel(lm.Config{Context: 32, Width: 32, Layers: 2, Heads: 4}, tok, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := New(model, Policy{MaxOutputTokens: 1_000_000, RequestTimeout: 10 * time.Second})
+
+	handled := make(chan struct{})
+	var once sync.Once
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		srv.Handler().ServeHTTP(w, r)
+		once.Do(func() { close(handled) })
+	}))
+	defer ts.Close()
+
+	baseline := runtime.NumGoroutine()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	data, _ := json.Marshal(map[string]any{
+		"messages":   []map[string]string{{"role": "user", "content": "Hi"}},
+		"max_tokens": 1_000_000,
+		"stream":     true,
+		"seed":       3,
+	})
+	req, err := http.NewRequestWithContext(ctx, "POST", ts.URL+"/v1/chat", bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Read up to the first delta so the handler is provably mid-generation.
+	reader := bufio.NewReader(resp.Body)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read SSE before first delta: %v", err)
+		}
+		if strings.Contains(line, "\"delta\"") {
+			break
+		}
+	}
+	cancel()
+	_ = resp.Body.Close()
+
+	select {
+	case <-handled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("generation kept running after the client disconnected")
+	}
+	if n := settleGoroutines(baseline+2, 5*time.Second); n > baseline+2 {
+		t.Fatalf("goroutines still running after disconnect: %d (baseline %d)", n, baseline)
+	}
+}
+
+func settleGoroutines(target int, timeout time.Duration) int {
+	deadline := time.Now().Add(timeout)
+	n := runtime.NumGoroutine()
+	for n > target && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		n = runtime.NumGoroutine()
+	}
+	return n
 }
 
 // TestRequestTimeoutEnforced verifies Policy.RequestTimeout actually stops

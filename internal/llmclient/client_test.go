@@ -3,10 +3,12 @@ package llmclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"m3tal-llm/internal/lm"
 	"m3tal-llm/internal/server"
@@ -94,6 +96,24 @@ func TestGeneratorAdapter(t *testing.T) {
 	}
 	if out == "" {
 		t.Fatal("empty generation")
+	}
+}
+
+// TestGeneratorGenerateWithContext checks the adapter's context-aware path:
+// an already-expired context fails fast with the context error instead of
+// generating, and the legacy Generate signature still works (covered above).
+func TestGeneratorGenerateWithContext(t *testing.T) {
+	c, _ := testClient(t)
+	g := NewGenerator(c)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	time.Sleep(2 * time.Millisecond)
+	start := time.Now()
+	if _, err := g.GenerateWithContext(ctx, "Hello", 64, 0.5, 7); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("cancelled request took %v", elapsed)
 	}
 }
 

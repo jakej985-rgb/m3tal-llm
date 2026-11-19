@@ -198,8 +198,18 @@ type Generator struct {
 // NewGenerator returns a Generator backed by client.
 func NewGenerator(client *Client) *Generator { return &Generator{client: client} }
 
-// Generate implements the assistant.Generator contract.
+// Generate implements the assistant.Generator contract. It has no caller
+// context, so it delegates to GenerateWithContext with
+// context.Background(); callers that need cancellation should use that
+// method instead.
 func (g *Generator) Generate(prompt string, maxTokens int, temperature float64, seed int64) (string, error) {
+	return g.GenerateWithContext(context.Background(), prompt, maxTokens, temperature, seed)
+}
+
+// GenerateWithContext is Generate with a caller-owned context: cancelling
+// ctx aborts the HTTP request, which in turn cancels generation on the
+// server, and the returned error wraps ctx.Err().
+func (g *Generator) GenerateWithContext(ctx context.Context, prompt string, maxTokens int, temperature float64, seed int64) (string, error) {
 	temp := temperature
 	if g.Temperature > 0 {
 		temp = g.Temperature
@@ -208,7 +218,7 @@ func (g *Generator) Generate(prompt string, maxTokens int, temperature float64, 
 	if g.MaxTokens > 0 && (outCap <= 0 || g.MaxTokens < outCap) {
 		outCap = g.MaxTokens
 	}
-	resp, err := g.client.Generate(context.Background(), GenerateRequest{
+	resp, err := g.client.Generate(ctx, GenerateRequest{
 		Prompt:      prompt,
 		MaxTokens:   outCap,
 		Temperature: temp,
