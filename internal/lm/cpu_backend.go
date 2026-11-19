@@ -103,6 +103,8 @@ type inferenceBackend interface {
 	Forward(tokenIDs []int) []float32
 	NewKVCache() *kvCache
 	ForwardStepKV(tokenID int, pos int, cache *kvCache) []float32
+	// Name reports the backend that runs requests: "cpu" or "cuda".
+	Name() string
 }
 
 type cpuInferenceBackend struct {
@@ -149,6 +151,8 @@ func (backend *cpuInferenceBackend) Forward(tokenIDs []int) []float32 {
 	vocab := backend.vocab
 	return cache.logits[last*vocab : (last+1)*vocab]
 }
+
+func (backend *cpuInferenceBackend) Name() string { return "cpu" }
 
 func (backend *cpuInferenceBackend) NewKVCache() *kvCache {
 	return newKVCache(len(backend.state.blocks))

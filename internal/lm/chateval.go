@@ -229,7 +229,7 @@ func (m *Model) RunChatEval(entries []ChatEvalEntry, opts ChatEvalOptions) (*Cha
 			Seed:        17,
 			Stop:        StopMarkers(),
 		}
-		out, stopHit, err := m.generateCore(context.Background(), promptText, opts, nil)
+		out, stopHit, err := m.generateCore(context.Background(), promptText, opts, nil, nil)
 		if err != nil {
 			return nil, fmt.Errorf("probe %s: %w", e.ID, err)
 		}

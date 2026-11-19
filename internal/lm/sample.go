@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"unicode/utf8"
+
+	"m3tal-llm/internal/tensor/kernel"
 )
 
 // This file implements generation sampling controls (issue: Stage 3
@@ -56,6 +58,38 @@ func (o GenerateOptions) Validate() error {
 		return fmt.Errorf("repetition penalty must be finite")
 	}
 	return nil
+}
+
+// GenerateStats is the runtime telemetry of one generation request.
+//
+// Backend is the backend that actually ran it; SelectedBackend is what
+// kernel selection asked for, so a CUDA build that could not initialise a
+// device shows up as selected "cuda", actual "cpu". FallbackCount counts
+// the tokens that had to use a full forward pass because the KV-cache
+// position exceeded the context window. Transfer counters are only
+// populated by backends that move data between host and device.
+type GenerateStats struct {
+	SelectedBackend string `json:"selected_backend"`
+	Backend         string `json:"backend"`
+	PromptTokens    int    `json:"prompt_tokens"`
+	OutputTokens    int    `json:"output_tokens"`
+	FallbackCount   int64  `json:"fallback_count"`
+	TransferCount   int64  `json:"transfer_count,omitempty"`
+	TransferBytes   int64  `json:"transfer_bytes,omitempty"`
+}
+
+// transferReporter is implemented by backends that can report host/device
+// transfer counters. The CPU backend does not implement it, so its stats
+// carry zero transfers.
+type transferReporter interface {
+	TransferStats() (count, bytes int64)
+}
+
+func transferStats(b inferenceBackend) (count, bytes int64) {
+	if r, ok := b.(transferReporter); ok {
+		return r.TransferStats()
+	}
+	return 0, 0
 }
 
 // sampleCandidate is a token id with its selection probability.
@@ -117,7 +151,10 @@ func pickCandidate(cands []sampleCandidate, temperature float64, rng *rand.Rand)
 // output and the error are both returned. Generation also stops at the next
 // token boundary once ctx is done, returning ctx.Err(); pass
 // context.Background() for no cancellation.
-func (m *Model) generateCore(ctx context.Context, prompt string, opts GenerateOptions, emit func(string) error) (string, bool, error) {
+// stats, when non-nil, receives the request telemetry; its transfer and
+// output counts are filled in on the way out so every return path reports
+// them.
+func (m *Model) generateCore(ctx context.Context, prompt string, opts GenerateOptions, emit func(string) error, stats *GenerateStats) (string, bool, error) {
 	if err := opts.Validate(); err != nil {
 		return "", false, err
 	}
@@ -139,6 +176,19 @@ func (m *Model) generateCore(ctx context.Context, prompt string, opts GenerateOp
 
 	generatedCounts := make(map[int]int)
 	genIDs := make([]int, 0, opts.MaxTokens)
+
+	if stats != nil {
+		stats.SelectedBackend = kernel.Selected()
+		stats.Backend = backend.Name()
+		stats.PromptTokens = len(ids)
+		transfersBefore, bytesBefore := transferStats(backend)
+		defer func() {
+			stats.OutputTokens = len(genIDs)
+			transfersAfter, bytesAfter := transferStats(backend)
+			stats.TransferCount = transfersAfter - transfersBefore
+			stats.TransferBytes = bytesAfter - bytesBefore
+		}()
+	}
 
 	// KV-cache prefill.
 	kvCache := backend.NewKVCache()
@@ -272,6 +322,9 @@ func (m *Model) generateCore(ctx context.Context, prompt string, opts GenerateOp
 			pos++
 		} else {
 			rawLogits = backend.Forward(ids)
+			if stats != nil {
+				stats.FallbackCount++
+			}
 		}
 	}
 	return string(prefix[genOffset:]), false, nil
@@ -279,7 +332,7 @@ func (m *Model) generateCore(ctx context.Context, prompt string, opts GenerateOp
 
 // GenerateWithOptions generates text with the given sampling options.
 func (m *Model) GenerateWithOptions(prompt string, opts GenerateOptions) (string, error) {
-	out, _, err := m.generateCore(context.Background(), prompt, opts, nil)
+	out, _, err := m.generateCore(context.Background(), prompt, opts, nil, nil)
 	return out, err
 }
 
@@ -288,8 +341,18 @@ func (m *Model) GenerateWithOptions(prompt string, opts GenerateOptions) (string
 // generated so far together with ctx.Err(). When emit is non-nil it receives
 // each decoded text delta as it is produced, like GenerateStream.
 func (m *Model) GenerateWithContext(ctx context.Context, prompt string, opts GenerateOptions, emit func(string) error) (string, error) {
-	out, _, err := m.generateCore(ctx, prompt, opts, emit)
+	out, _, err := m.generateCore(ctx, prompt, opts, emit, nil)
 	return out, err
+}
+
+// GenerateWithContextStats is GenerateWithContext plus runtime telemetry:
+// the selected and actual backend, prompt and output token counts, how many
+// tokens used the full-forward fallback, and host/device transfer counters
+// when the backend reports them.
+func (m *Model) GenerateWithContextStats(ctx context.Context, prompt string, opts GenerateOptions, emit func(string) error) (string, GenerateStats, error) {
+	var stats GenerateStats
+	out, _, err := m.generateCore(ctx, prompt, opts, emit, &stats)
+	return out, stats, err
 }
 
 // GenerateStream generates text like GenerateWithOptions but invokes emit
@@ -297,7 +360,7 @@ func (m *Model) GenerateWithContext(ctx context.Context, prompt string, opts Gen
 // error, generation stops and the partial output is returned with the
 // error wrapped as "stream cancelled".
 func (m *Model) GenerateStream(prompt string, opts GenerateOptions, emit func(string) error) (string, error) {
-	out, _, err := m.generateCore(context.Background(), prompt, opts, emit)
+	out, _, err := m.generateCore(context.Background(), prompt, opts, emit, nil)
 	return out, err
 }
 

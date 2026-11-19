@@ -1,6 +1,7 @@
 package lm
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -118,6 +119,58 @@ func TestGenerateStreamCancel(t *testing.T) {
 		t.Fatalf("sentinel not wrapped: %v", err)
 	}
 	_ = out // partial output returned alongside error
+}
+
+func TestGenerateStats(t *testing.T) {
+	m := sampleTestModel(t)
+	prompt := "Hi"
+	if encoded := len(m.Tokenizer.Encode(prompt)); encoded+4 > m.Config.Context {
+		t.Fatalf("test prompt needs %d tokens; pick a shorter one", encoded)
+	}
+	_, stats, err := m.GenerateWithContextStats(context.Background(), prompt, GenerateOptions{
+		MaxTokens: 4, Temperature: 0, Seed: 1,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Backend != "cpu" || stats.SelectedBackend != "cpu" {
+		t.Fatalf("backend %q selected %q, want cpu/cpu", stats.Backend, stats.SelectedBackend)
+	}
+	if stats.PromptTokens <= 0 {
+		t.Fatalf("prompt tokens %d, want > 0", stats.PromptTokens)
+	}
+	if stats.OutputTokens <= 0 || stats.OutputTokens > 4 {
+		t.Fatalf("output tokens %d, want 1..4", stats.OutputTokens)
+	}
+	if stats.FallbackCount != 0 {
+		t.Fatalf("fallback count %d, want 0 for a short prompt", stats.FallbackCount)
+	}
+	if stats.TransferCount != 0 || stats.TransferBytes != 0 {
+		t.Fatalf("CPU backend reported transfers %d/%d", stats.TransferCount, stats.TransferBytes)
+	}
+}
+
+func TestGenerateStatsCountsFallback(t *testing.T) {
+	m := sampleTestModel(t)
+	// Grow the prompt until it fills the context window: then there is no
+	// room for a KV step, so generated tokens must use the full-forward
+	// fallback.
+	prompt := "Hi"
+	for len(m.Tokenizer.Encode(prompt)) < m.Config.Context {
+		prompt += " word"
+	}
+	_, stats, err := m.GenerateWithContextStats(context.Background(), prompt, GenerateOptions{
+		MaxTokens: 3, Temperature: 0, Seed: 1,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.FallbackCount == 0 {
+		t.Fatal("full-forward fallback was not counted")
+	}
+	if stats.OutputTokens <= 0 {
+		t.Fatalf("output tokens %d, want > 0", stats.OutputTokens)
+	}
 }
 
 func TestGenerateOptionValidation(t *testing.T) {

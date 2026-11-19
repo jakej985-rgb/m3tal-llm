@@ -20,7 +20,7 @@ available via the `cuda` build tag (`docs/CUDA.md`).
  "top_k": 0, "top_p": 0.0, "seed": 19, "stop": ["<|im_end|>"]}
 ```
 
-→ `{"text": "..."}`
+→ `{"text": "...", "usage": {...}}`
 
 `temperature: 0` selects greedy argmax. `top_k`/`top_p` are optional
 filters (0 = disabled). `seed` makes sampling deterministic.
@@ -32,18 +32,20 @@ filters (0 = disabled). `seed` makes sampling deterministic.
  "max_tokens": 64, "temperature": 0.0, "stream": false}
 ```
 
-→ `{"text": "...", "template": "m3tal.chatml.v1"}`
+→ `{"text": "...", "template": "m3tal.chatml.v1", "usage": {...}}`
 
 With `"stream": true` the response is `text/event-stream`: each
-`data:` line carries `{"delta": "..."}` and the stream ends with
-`data: [DONE]`. Generation always appends the chat stop markers, so
+`data:` line carries `{"delta": "..."}`, the final event carries
+`{"usage": {...}}`, and the stream ends with `data: [DONE]`. Generation always appends the chat stop markers, so
 `<|im_end|>` terminates output and is stripped.
 
 ### Errors
 
 All errors return `{"error": "..."}` with an appropriate status:
 `400` malformed JSON/invalid request, `413` prompt or body over the
-safety limits, `500` internal.
+safety limits, `503` server at capacity or queue wait timeout (with
+`Retry-After: 1`), `504` request deadline or generation timeout,
+`500` internal.
 
 ## Safety policy (configurable, not in weights)
 
@@ -53,11 +55,57 @@ safety limits, `500` internal.
 - `MaxPromptTokens` — encoded prompt cap (default 4096)
 - `MaxOutputTokens` — per-request generation cap (default 512)
 - `RequestTimeout` — per-request deadline (default 2m)
+- `MaxConcurrent` — generations running at once (default 4)
+- `MaxQueue` — requests waiting for a slot (default 8; a negative
+  value rejects excess requests immediately instead of queueing)
+- `QueueTimeout` — maximum queue wait (default 10s)
 
 CLI flags: `--max-prompt-tokens`, `--max-output-tokens`,
-`--max-body-mb`, `--timeout`. The safety layer lives in
-`internal/server` and can be tuned or replaced without touching model
-weights.
+`--max-body-mb`, `--timeout`, `--max-concurrent`, `--max-queue`,
+`--queue-timeout`. The safety layer lives in `internal/server` and can
+be tuned or replaced without touching model weights.
+
+## Scheduling and telemetry
+
+Generation runs behind a slot semaphore: at most `MaxConcurrent`
+requests decode at once, up to `MaxQueue` more wait for a slot, and a
+waiter that exceeds `QueueTimeout` (or whose client disconnects) is
+removed without touching the model. Admission is deterministic:
+
+- no slot and a full queue or queueing disabled → `503` "server at capacity";
+- queue wait exceeded → `503` “queue wait exceeded”;
+- request deadline while queued → `504`.
+
+Each generation is one KV-cache owner: the cache is created per request
+and freed when the request returns, so concurrent requests never share
+cache state.
+
+Every successful response carries per-request telemetry:
+
+```json
+"usage": {
+  "selected_backend": "cuda", "backend": "cpu",
+  "prompt_tokens": 18, "output_tokens": 64,
+  "fallback_count": 0, "transfer_count": 12, "transfer_bytes": 4096,
+  "queue_ms": 0, "generation_ms": 832
+}
+```
+
+`selected_backend` is what kernel selection asked for; `backend` is what
+actually ran, so a CUDA build that fell back to CPU is visible.
+`fallback_count` counts tokens that needed a full forward pass because
+the KV cache reached the context limit. Transfer counters are populated
+by the CUDA backend and omitted on CPU. Non-streaming responses also
+set `X-M3tal-Backend`, `X-M3tal-Queue-Ms` and `X-M3tal-Generation-Ms`
+headers. `/healthz` reports `backend` (last backend used, or `unloaded`),
+`max_concurrent`, `max_queue`, `inflight` and `queued`.
+
+Race-enabled tests cover parallel requests, overload, queue timeout,
+cancellation and connection shutdown:
+
+```sh
+go test -race ./internal/server ./internal/nn
+```
 
 ## Go client
 

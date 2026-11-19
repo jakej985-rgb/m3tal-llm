@@ -1405,6 +1405,9 @@ func serveLLM(args []string) error {
 	maxOutput := flags.Int("max-output-tokens", 0, "max generated tokens per request (0 = server default)")
 	maxBodyMB := flags.Int64("max-body-mb", 0, "max request body MiB (0 = server default)")
 	timeoutSec := flags.Int("timeout", 0, "per-request timeout seconds (0 = server default)")
+	maxConcurrent := flags.Int("max-concurrent", -1, "max concurrent generations (-1 = server default)")
+	maxQueue := flags.Int("max-queue", 0, "max waiting requests (-1 = reject when busy, 0 = server default)")
+	queueTimeoutSec := flags.Int("queue-timeout", -1, "queue wait timeout seconds (-1 = server default)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -1428,14 +1431,25 @@ func serveLLM(args []string) error {
 	if *timeoutSec > 0 {
 		policy.RequestTimeout = time.Duration(*timeoutSec) * time.Second
 	}
+	if *maxConcurrent > 0 {
+		policy.MaxConcurrent = *maxConcurrent
+	}
+	if *maxQueue != 0 {
+		policy.MaxQueue = *maxQueue
+	}
+	if *queueTimeoutSec > 0 {
+		policy.QueueTimeout = time.Duration(*queueTimeoutSec) * time.Second
+	}
 	srv := server.New(model, policy)
 	httpSrv := &http.Server{
 		Addr:              *addr,
 		Handler:           srv.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	fmt.Printf("m3tal-lm serve: %s (params %d, prompt<=%d tok, output<=%d tok)\n",
-		*addr, model.ParameterCount(), srv.Policy().MaxPromptTokens, srv.Policy().MaxOutputTokens)
+	effective := srv.Policy()
+	fmt.Printf("m3tal-lm serve: %s (params %d, prompt<=%d tok, output<=%d tok, concurrent<=%d, queue<=%d)\n",
+		*addr, model.ParameterCount(), effective.MaxPromptTokens, effective.MaxOutputTokens,
+		effective.MaxConcurrent, effective.MaxQueue)
 	return httpSrv.ListenAndServe()
 }
 

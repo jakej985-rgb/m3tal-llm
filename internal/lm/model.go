@@ -780,6 +780,19 @@ func (m *Model) inferenceBackend() inferenceBackend {
 	return m.backend
 }
 
+// InferenceBackendName reports the backend of the cached inference
+// snapshot ("cpu" or "cuda"), or "unloaded" before the first generation.
+// It deliberately does not construct a backend, so a health check cannot
+// clone weights or allocate device memory.
+func (m *Model) InferenceBackendName() string {
+	m.backendMu.Lock()
+	defer m.backendMu.Unlock()
+	if m.backend == nil {
+		return "unloaded"
+	}
+	return m.backend.Name()
+}
+
 // invalidateBackend drops the cached inference snapshot after training has
 // changed the weights. Generators already holding a snapshot keep using it.
 func (m *Model) invalidateBackend() {

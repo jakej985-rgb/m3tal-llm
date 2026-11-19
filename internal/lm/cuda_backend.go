@@ -5,6 +5,7 @@ package lm
 import (
 	"fmt"
 	"math"
+	"sync/atomic"
 
 	"m3tal-llm/internal/gpu"
 )
@@ -89,6 +90,25 @@ type cudaInferenceBackend struct {
 	vocab  int
 	w      cudaWeights
 	host   inferenceWeights
+
+	// Host/device transfer counters for request telemetry. They are
+	// process-wide for this snapshot; generation diffs them around one
+	// request, and atomics keep concurrent requests from racing.
+	transferCount atomic.Int64
+	transferBytes atomic.Int64
+}
+
+func (b *cudaInferenceBackend) Name() string { return "cuda" }
+
+func (b *cudaInferenceBackend) recordTransfer(n int) {
+	b.transferCount.Add(1)
+	b.transferBytes.Add(int64(n))
+}
+
+// TransferStats reports the cumulative host/device transfers since this
+// backend was built.
+func (b *cudaInferenceBackend) TransferStats() (int64, int64) {
+	return b.transferCount.Load(), b.transferBytes.Load()
 }
 
 // newCUDAInferenceBackend uploads a snapshot of the model weights to the
@@ -373,6 +393,7 @@ func (b *cudaInferenceBackend) Forward(tokenIDs []int) []float32 {
 	if err := uploadIDs(s, ids); err != nil {
 		return b.forwardCPU(ids)
 	}
+	b.recordTransfer(len(ids) * 4)
 	if err := b.runTransformer(s, rows, rows, true, nil, nil); err != nil {
 		return b.forwardCPU(ids)
 	}
@@ -389,6 +410,7 @@ func (b *cudaInferenceBackend) Forward(tokenIDs []int) []float32 {
 	if err := rowBuf.Download(last); err != nil {
 		return b.forwardCPU(ids)
 	}
+	b.recordTransfer(len(last) * 4)
 	return last
 }
 
@@ -511,6 +533,7 @@ func (b *cudaInferenceBackend) ForwardStepKV(tokenID int, pos int, cache *kvCach
 		cache.cpuOnly = true
 		return forwardStepKV(b.config, b.vocab, b.host, tokenID, pos, cache)
 	}
+	b.recordTransfer(4)
 
 	// Token embedding for the single step token.
 	if err := gpu.EmbedF32(b.w.tokenEmb, s.ids, s.x, 1, width); err != nil {
@@ -576,6 +599,7 @@ func (b *cudaInferenceBackend) ForwardStepKV(tokenID int, pos int, cache *kvCach
 			ok = false
 			break
 		}
+		b.recordTransfer(2 * width * 4)
 		lc.k = append(lc.k, kSlice...)
 		lc.v = append(lc.v, vSlice...)
 		appended++
@@ -649,5 +673,6 @@ func (b *cudaInferenceBackend) ForwardStepKV(tokenID int, pos int, cache *kvCach
 		cache.cpuOnly = true
 		return forwardStepKV(b.config, b.vocab, b.host, tokenID, pos, cache)
 	}
+	b.recordTransfer(len(out) * 4)
 	return out
 }
