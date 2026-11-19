@@ -38,8 +38,8 @@ jobs:
       - name: Test
         run: go test ./...
 
-      - name: Race tests (scheduling and KV cache)
-        run: go test -race ./internal/server ./internal/nn
+      - name: Race tests (scheduling, KV cache, cancellation)
+        run: go test -race ./internal/lm ./internal/server ./internal/nn
 
       - name: Static analysis
         uses: dominikh/staticcheck-action@v1
