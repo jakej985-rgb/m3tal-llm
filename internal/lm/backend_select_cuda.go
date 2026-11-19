@@ -13,9 +13,13 @@ import "m3tal-llm/internal/tensor/kernel"
 // construction failure falls back to CPU so inference always works.
 func newInferenceBackend(m *Model) inferenceBackend {
 	if kernel.Selected() == "cuda" {
+		// Read-only planning step: log the estimate and the device budget
+		// before any weights are uploaded.
+		logInferenceMemoryPlan(m, "cuda", gpuMemoryProvider{})
 		if b, err := newCUDAInferenceBackend(m); err == nil {
 			return b
 		}
 	}
+	logInferenceMemoryPlan(m, "cpu", nil)
 	return newCPUInferenceBackend(m)
 }

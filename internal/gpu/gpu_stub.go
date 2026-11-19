@@ -19,6 +19,12 @@ import (
 // usable device exists.
 var ErrUnavailable = errors.New("CUDA backend unavailable: rebuild with CGO_ENABLED=1 go build -tags cuda (see docs/CUDA.md)")
 
+// AvailableMemoryBytes reports free device memory. Stub builds have no CUDA
+// device, so callers fall back to their estimate-only path.
+func AvailableMemoryBytes() (int64, error) {
+	return 0, ErrUnavailable
+}
+
 // Buffer is an opaque device allocation placeholder for stub builds.
 type Buffer struct {
 	bytes int

@@ -55,6 +55,17 @@ static int m3tal_cuda_current_device(void) {
 	return device;
 }
 
+// Free/total bytes on the current device; returns a CUDA error code (0 on
+// success). Used by the inference memory planner.
+static int m3tal_cuda_mem_info(size_t *freeBytes, size_t *totalBytes) {
+	size_t freeNow = 0, total = 0;
+	cudaError_t err = cudaMemGetInfo(&freeNow, &total);
+	if (err != cudaSuccess) return (int)err;
+	*freeBytes = freeNow;
+	*totalBytes = total;
+	return 0;
+}
+
 // Kernel launchers implemented in kernels.cu (extern "C").
 int m3tal_launch_gemm_f32(const void* A, const void* B, void* C, int M, int N, int K);
 int m3tal_launch_gemm_f64(const void* A, const void* B, void* C, int M, int N, int K);
@@ -137,6 +148,22 @@ func ProbeDevice() (DeviceInfo, error) {
 		Minor:      int(minor),
 		DeviceArch: fmt.Sprintf("sm_%d%d", int(major), int(minor)),
 	}, nil
+}
+
+// AvailableMemoryBytes reports free memory on the current CUDA device, in
+// bytes. It is the inference memory planner's device budget query; a failure
+// (no runtime, no device, driver error) is returned for callers to treat as
+// an unknown budget.
+func AvailableMemoryBytes() (int64, error) {
+	var freeBytes, totalBytes C.size_t
+	if code := C.m3tal_cuda_mem_info(&freeBytes, &totalBytes); code != 0 {
+		return 0, fmt.Errorf("cudaMemGetInfo failed: error %d", int(code))
+	}
+	const maxInt64 = uint64(1<<63 - 1)
+	if uint64(freeBytes) > maxInt64 {
+		return 0, fmt.Errorf("cudaMemGetInfo reported %d free bytes, which overflows int64", uint64(freeBytes))
+	}
+	return int64(freeBytes), nil
 }
 
 // LastError returns the most recent CUDA error observed by this package,
