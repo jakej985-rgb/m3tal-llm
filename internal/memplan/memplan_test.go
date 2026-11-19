@@ -22,8 +22,8 @@ func (f *fakeProvider) AvailableBytes() (int64, error) {
 //
 //	weights  1000*4                                      = 4000
 //	kv       2*2 layers*1*4 tokens*8 width*4             =  512
-//	scratch  (1*4*8*24 + 1*4*16 + 1*2*4*4)*4            = 3456
-//	total                                                = 7968
+//	scratch  (1*4*8*28*2 + 2*1*4*16 + 1*2*4*4)*4        = 7808
+//	total                                                = 12320
 func testConfig() Config {
 	return Config{
 		Parameters:       1000,
@@ -79,8 +79,8 @@ func TestEstimateComponents(t *testing.T) {
 	want := Requirements{
 		WeightsBytes: 4000,
 		KVCacheBytes: 512,
-		ScratchBytes: 3456,
-		TotalBytes:   7968,
+		ScratchBytes: 7808,
+		TotalBytes:   12320,
 	}
 	if got != want {
 		t.Fatalf("Estimate = %+v, want %+v", got, want)
@@ -94,11 +94,11 @@ func TestEstimateHeadroom(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.HeadroomBytes != 797 { // ceil(7968 * 0.10)
-		t.Fatalf("headroom = %d, want 797", got.HeadroomBytes)
+	if got.HeadroomBytes != 1232 { // ceil(12320 * 0.10)
+		t.Fatalf("headroom = %d, want 1232", got.HeadroomBytes)
 	}
-	if got.TotalBytes != 8765 {
-		t.Fatalf("total = %d, want 8765", got.TotalBytes)
+	if got.TotalBytes != 13552 {
+		t.Fatalf("total = %d, want 13552", got.TotalBytes)
 	}
 }
 
@@ -109,8 +109,8 @@ func TestEstimateDefaultsHeadroomWhenUnset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.HeadroomBytes != 797 {
-		t.Fatalf("default headroom = %d, want 797", got.HeadroomBytes)
+	if got.HeadroomBytes != 1232 {
+		t.Fatalf("default headroom = %d, want 1232", got.HeadroomBytes)
 	}
 }
 
@@ -214,7 +214,7 @@ func TestEstimateKVScalesWithContext(t *testing.T) {
 
 func TestPlanFitsAsRequested(t *testing.T) {
 	req := testRequest(1, 4)
-	decision, err := Plan(req, Limits{Provider: &fakeProvider{available: 7968}})
+	decision, err := Plan(req, Limits{Provider: &fakeProvider{available: 12320}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,13 +227,13 @@ func TestPlanFitsAsRequested(t *testing.T) {
 	if decision.Admitted != req {
 		t.Fatalf("admitted = %+v, want requested", decision.Admitted)
 	}
-	if decision.AvailableBytes != 7968 {
-		t.Fatalf("available = %d, want 7968", decision.AvailableBytes)
+	if decision.AvailableBytes != 12320 {
+		t.Fatalf("available = %d, want 12320", decision.AvailableBytes)
 	}
 }
 
 func TestPlanBoundaryOneByteShortReducesContext(t *testing.T) {
-	decision, err := Plan(testRequest(1, 4), Limits{Provider: &fakeProvider{available: 7967}})
+	decision, err := Plan(testRequest(1, 4), Limits{Provider: &fakeProvider{available: 12319}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,14 +249,14 @@ func TestPlanBoundaryOneByteShortReducesContext(t *testing.T) {
 	if decision.Requirements.TotalBytes > decision.AvailableBytes {
 		t.Fatalf("admitted %d bytes > available %d", decision.Requirements.TotalBytes, decision.AvailableBytes)
 	}
-	if decision.RequestedRequirements.TotalBytes != 7968 {
-		t.Fatalf("requested requirements = %d, want 7968 preserved", decision.RequestedRequirements.TotalBytes)
+	if decision.RequestedRequirements.TotalBytes != 12320 {
+		t.Fatalf("requested requirements = %d, want 12320 preserved", decision.RequestedRequirements.TotalBytes)
 	}
 }
 
 func TestPlanReducesBatchBeforeContext(t *testing.T) {
-	req := testRequest(2, 4) // 11936 bytes
-	decision, err := Plan(req, Limits{Provider: &fakeProvider{available: 8000}})
+	req := testRequest(2, 4) // 20640 bytes
+	decision, err := Plan(req, Limits{Provider: &fakeProvider{available: 13000}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,8 +269,8 @@ func TestPlanReducesBatchBeforeContext(t *testing.T) {
 	if decision.Admitted.Batch != 1 || decision.Admitted.ContextTokens != 4 {
 		t.Fatalf("admitted = %+v, want batch 1 context 4", decision.Admitted)
 	}
-	if decision.Requirements.TotalBytes != 7968 {
-		t.Fatalf("admitted requirements = %d, want 7968", decision.Requirements.TotalBytes)
+	if decision.Requirements.TotalBytes != 12320 {
+		t.Fatalf("admitted requirements = %d, want 12320", decision.Requirements.TotalBytes)
 	}
 }
 
@@ -282,8 +282,8 @@ func TestPlanLowMemoryRefuses(t *testing.T) {
 	if decision.Admitted.ContextTokens != 1 {
 		t.Fatalf("admitted context = %d, want the minimum of 1", decision.Admitted.ContextTokens)
 	}
-	if decision.Requirements.TotalBytes != 4968 {
-		t.Fatalf("minimum requirements = %d, want 4968", decision.Requirements.TotalBytes)
+	if decision.Requirements.TotalBytes != 6056 {
+		t.Fatalf("minimum requirements = %d, want 6056", decision.Requirements.TotalBytes)
 	}
 	if decision.AvailableBytes != 1000 {
 		t.Fatalf("available = %d, want 1000", decision.AvailableBytes)
@@ -291,9 +291,9 @@ func TestPlanLowMemoryRefuses(t *testing.T) {
 }
 
 func TestPlanHonorsMinimumContext(t *testing.T) {
-	// Context 2 fits in 6000 bytes, but the caller forbids going below 3.
+	// Context 2 fits in 8500 bytes, but the caller forbids going below 3.
 	decision, err := Plan(testRequest(1, 4), Limits{
-		Provider:         &fakeProvider{available: 6000},
+		Provider:         &fakeProvider{available: 8500},
 		MinContextTokens: 3,
 	})
 	if !errors.Is(err, ErrInsufficientMemory) {
@@ -302,8 +302,8 @@ func TestPlanHonorsMinimumContext(t *testing.T) {
 	if decision.Admitted.ContextTokens != 3 {
 		t.Fatalf("admitted context = %d, want 3", decision.Admitted.ContextTokens)
 	}
-	if decision.Requirements.TotalBytes != 6952 {
-		t.Fatalf("requirements = %d, want 6952", decision.Requirements.TotalBytes)
+	if decision.Requirements.TotalBytes != 10216 {
+		t.Fatalf("requirements = %d, want 10216", decision.Requirements.TotalBytes)
 	}
 }
 
@@ -335,10 +335,10 @@ func TestPlanAdvisoryWhenProviderUnsupported(t *testing.T) {
 }
 
 func TestPlanFallsBackToUserCapOnProviderError(t *testing.T) {
-	req := testRequest(2, 4) // 11936 bytes
+	req := testRequest(2, 4) // 20640 bytes
 	decision, err := Plan(req, Limits{
 		Provider:     &fakeProvider{err: ErrUnsupported},
-		UserCapBytes: 8000,
+		UserCapBytes: 13000,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -371,25 +371,25 @@ func TestPlanUsesStrictestBudget(t *testing.T) {
 	t.Run("user cap is stricter", func(t *testing.T) {
 		decision, err := Plan(testRequest(2, 4), Limits{
 			Provider:     &fakeProvider{available: 100000},
-			UserCapBytes: 8000,
+			UserCapBytes: 13000,
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if decision.Source != SourceUserCap || decision.AvailableBytes != 8000 {
-			t.Fatalf("source=%q available=%d, want user_cap/8000", decision.Source, decision.AvailableBytes)
+		if decision.Source != SourceUserCap || decision.AvailableBytes != 13000 {
+			t.Fatalf("source=%q available=%d, want user_cap/13000", decision.Source, decision.AvailableBytes)
 		}
 	})
 	t.Run("provider is stricter", func(t *testing.T) {
 		decision, err := Plan(testRequest(2, 4), Limits{
-			Provider:     &fakeProvider{available: 8000},
+			Provider:     &fakeProvider{available: 13000},
 			UserCapBytes: 100000,
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
-		if decision.Source != SourceProvider || decision.AvailableBytes != 8000 {
-			t.Fatalf("source=%q available=%d, want provider/8000", decision.Source, decision.AvailableBytes)
+		if decision.Source != SourceProvider || decision.AvailableBytes != 13000 {
+			t.Fatalf("source=%q available=%d, want provider/13000", decision.Source, decision.AvailableBytes)
 		}
 	})
 }

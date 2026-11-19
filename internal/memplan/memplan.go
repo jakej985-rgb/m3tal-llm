@@ -65,10 +65,16 @@ const (
 	// set so allocator fragmentation and unreported runtime state do not
 	// turn a "fits" estimate into an out-of-memory failure.
 	DefaultHeadroomFraction = 0.10
-	// DefaultActivationBuffers approximates how many width-sized activation
-	// buffers the forward pass holds simultaneously (norm outputs, Q/K/V,
-	// attention output, residuals, SwiGLU gate/up/activated, projections).
-	DefaultActivationBuffers = 24
+	// DefaultActivationBuffers is the number of width-sized activation
+	// buffers retained per layer (norm outputs, Q/K/V, attention output,
+	// residuals, SwiGLU gate/up/activated, projections). It is calibrated
+	// against measured CPU forward allocations in
+	// internal/lm/scratch_calibration_test.go: ~20.2 buffers per layer were
+	// observed for a 32-token, 32-wide model, and 28 leaves headroom for
+	// allocator bookkeeping. The batch-forward path retains every layer's
+	// buffers, so this term scales with Layers; KV generation is
+	// conservatively over-reserved.
+	DefaultActivationBuffers = 28
 	// DefaultScaleBits is the per-group quant scale width (fp16).
 	DefaultScaleBits = 16
 )
@@ -113,8 +119,8 @@ type Config struct {
 	// HeadroomFraction is reserved on top of the working set. Zero selects
 	// DefaultHeadroomFraction; a negative value disables headroom.
 	HeadroomFraction float64
-	// ActivationBuffers is the number of width-sized activation buffers.
-	// Zero selects DefaultActivationBuffers.
+	// ActivationBuffers is the number of width-sized activation buffers
+	// retained per layer. Zero selects DefaultActivationBuffers.
 	ActivationBuffers int
 }
 
@@ -246,10 +252,11 @@ type Decision struct {
 //     only for INT8/INT4 weights
 //   - KV cache    = 2 (K and V) * layers * batch * context * width
 //   - bits(KVDType)
-//   - scratch     = batch*context*width*ActivationBuffers
-//   - batch*context*vocab (logits)
+//   - scratch     = batch*context*width*ActivationBuffers*layers
+//   - 2*batch*context*vocab (logits and probabilities)
 //   - batch*heads*context*context (attention scores)
-//     all at bits(ActivationDType)
+//     all at bits(ActivationDType); the per-layer term is calibrated
+//     against measured allocations rather than assumed
 //   - headroom    = ceil((weights+metadata+kv+scratch) * HeadroomFraction)
 func Estimate(req Request) (Requirements, error) {
 	cfg, err := req.Config.normalize()
@@ -296,11 +303,11 @@ func Estimate(req Request) (Requirements, error) {
 		return Requirements{}, fmt.Errorf("kv cache: %w", err)
 	}
 
-	activationElements, err := mulChain(int64(req.Batch), int64(req.ContextTokens), int64(cfg.Width), int64(cfg.ActivationBuffers))
+	activationElements, err := mulChain(int64(req.Batch), int64(req.ContextTokens), int64(cfg.Width), int64(cfg.ActivationBuffers), int64(cfg.Layers))
 	if err != nil {
 		return Requirements{}, fmt.Errorf("scratch activations: %w", err)
 	}
-	logitElements, err := mulChain(int64(req.Batch), int64(req.ContextTokens), int64(cfg.Vocab))
+	logitElements, err := mulChain(2, int64(req.Batch), int64(req.ContextTokens), int64(cfg.Vocab))
 	if err != nil {
 		return Requirements{}, fmt.Errorf("scratch logits: %w", err)
 	}
