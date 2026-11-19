@@ -111,6 +111,29 @@ func (b *cudaInferenceBackend) TransferStats() (int64, int64) {
 	return b.transferCount.Load(), b.transferBytes.Load()
 }
 
+// AllocatedBytes reports the device weight bytes plus the retained host
+// fallback clone, so the load-time estimate can be compared with reality.
+func (b *cudaInferenceBackend) AllocatedBytes() (weights, host int64) {
+	return cudaWeightsBytes(b.w), inferenceWeightsBytes(b.host)
+}
+
+// cudaWeightsBytes sums every device buffer owned by a CUDA snapshot.
+func cudaWeightsBytes(w cudaWeights) int64 {
+	bytes := int64(w.tokenEmb.Bytes())
+	for _, block := range w.blocks {
+		bytes += int64(block.normAttn.Bytes() + block.normFF.Bytes())
+		layers := []cudaLayer{
+			block.query, block.key, block.value, block.attnOut,
+			block.ffGate, block.ffUp, block.ffDown,
+		}
+		for _, layer := range layers {
+			bytes += int64(layer.w.Bytes() + layer.b.Bytes())
+		}
+	}
+	bytes += int64(w.output.w.Bytes() + w.output.b.Bytes())
+	return bytes
+}
+
 // newCUDAInferenceBackend uploads a snapshot of the model weights to the
 // GPU. It returns an error when CUDA is unavailable or allocation fails;
 // callers should fall back to the CPU backend.

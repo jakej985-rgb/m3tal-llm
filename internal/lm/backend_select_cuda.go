@@ -15,11 +15,14 @@ func newInferenceBackend(m *Model) inferenceBackend {
 	if kernel.Selected() == "cuda" {
 		// Read-only planning step: log the estimate and the device budget
 		// before any weights are uploaded.
-		logInferenceMemoryPlan(m, "cuda", gpuMemoryProvider{})
+		plan, planned := logInferenceMemoryPlan(m, "cuda", gpuMemoryProvider{})
 		if b, err := newCUDAInferenceBackend(m); err == nil {
+			logInferenceMemoryActual(b, plan, planned)
 			return b
 		}
 	}
-	logInferenceMemoryPlan(m, "cpu", nil)
-	return newCPUInferenceBackend(m)
+	plan, planned := logInferenceMemoryPlan(m, "cpu", nil)
+	backend := newCPUInferenceBackend(m)
+	logInferenceMemoryActual(backend, plan, planned)
+	return backend
 }

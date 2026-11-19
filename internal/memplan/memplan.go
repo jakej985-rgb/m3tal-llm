@@ -143,6 +143,52 @@ func (r Requirements) String() string {
 		r.ScratchBytes, r.HeadroomBytes, r.TotalBytes)
 }
 
+// ActualAllocation describes memory measured after a backend has allocated.
+// KVCacheBytes and ScratchBytes are zero when those buffers are created per
+// request instead of at load time. HostBytes covers host-side copies the
+// estimate does not model, such as a CUDA fallback clone.
+type ActualAllocation struct {
+	WeightsBytes int64
+	KVCacheBytes int64
+	ScratchBytes int64
+	HostBytes    int64
+}
+
+// ConstructionBytes is the total measured at load time.
+func (a ActualAllocation) ConstructionBytes() int64 {
+	return a.WeightsBytes + a.KVCacheBytes + a.ScratchBytes + a.HostBytes
+}
+
+// Comparison relates an estimate to a measured allocation. WeightDeltaBytes
+// is the diagnostic that matters most: a non-zero value means the model to
+// planner mapping has drifted from what the backend really allocates.
+type Comparison struct {
+	Estimated         Requirements
+	Actual            ActualAllocation
+	WeightDeltaBytes  int64
+	HostOverheadBytes int64
+}
+
+// Compare pairs an estimate with measured allocation without judging it; the
+// caller decides whether a delta is acceptable. KV cache and scratch are
+// per-request buffers in the current backends, so a construction-time
+// comparison normally leaves them zero.
+func Compare(estimated Requirements, actual ActualAllocation) Comparison {
+	return Comparison{
+		Estimated:         estimated,
+		Actual:            actual,
+		WeightDeltaBytes:  actual.WeightsBytes - estimated.WeightsBytes,
+		HostOverheadBytes: actual.HostBytes,
+	}
+}
+
+func (c Comparison) String() string {
+	return fmt.Sprintf(
+		"estimated_weights=%dB actual_weights=%dB weight_delta=%dB host_copy=%dB actual_at_load=%dB estimated_total=%dB",
+		c.Estimated.WeightsBytes, c.Actual.WeightsBytes, c.WeightDeltaBytes,
+		c.HostOverheadBytes, c.Actual.ConstructionBytes(), c.Estimated.TotalBytes)
+}
+
 // Provider reports free memory (device or otherwise) in bytes. Availability
 // is queried per plan, never cached by this package.
 type Provider interface {

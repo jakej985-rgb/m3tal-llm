@@ -3,6 +3,7 @@ package memplan
 import (
 	"errors"
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -40,6 +41,34 @@ func testConfig() Config {
 func testRequest(batch, context int) Request {
 	cfg := testConfig()
 	return Request{Config: cfg, Batch: batch, ContextTokens: context}
+}
+
+func TestCompareReportsWeightDelta(t *testing.T) {
+	estimated := Requirements{
+		WeightsBytes:  4000,
+		KVCacheBytes:  512,
+		ScratchBytes:  3456,
+		HeadroomBytes: 797,
+		TotalBytes:    8765,
+	}
+	exact := Compare(estimated, ActualAllocation{WeightsBytes: 4000, HostBytes: 1000})
+	if exact.WeightDeltaBytes != 0 {
+		t.Fatalf("weight delta = %d, want 0", exact.WeightDeltaBytes)
+	}
+	if exact.HostOverheadBytes != 1000 {
+		t.Fatalf("host overhead = %d, want 1000", exact.HostOverheadBytes)
+	}
+	if exact.Actual.ConstructionBytes() != 5000 {
+		t.Fatalf("construction bytes = %d, want 5000", exact.Actual.ConstructionBytes())
+	}
+	if got := exact.String(); !strings.Contains(got, "weight_delta=0B") || !strings.Contains(got, "host_copy=1000B") {
+		t.Fatalf("comparison string missing fields: %s", got)
+	}
+
+	drifted := Compare(estimated, ActualAllocation{WeightsBytes: 4096})
+	if drifted.WeightDeltaBytes != 96 {
+		t.Fatalf("drifted weight delta = %d, want 96", drifted.WeightDeltaBytes)
+	}
 }
 
 func TestEstimateComponents(t *testing.T) {

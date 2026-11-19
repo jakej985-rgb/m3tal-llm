@@ -55,15 +55,42 @@ func (gpuMemoryProvider) AvailableBytes() (int64, error) {
 // allocate and logs it. This is a read-only step: the plan neither reserves
 // nor reduces anything, and allocation behavior is unchanged. A shortfall is
 // logged so the estimates can be calibrated before enforcement.
-func logInferenceMemoryPlan(m *Model, backend string, provider memplan.Provider) {
+func logInferenceMemoryPlan(m *Model, backend string, provider memplan.Provider) (memplan.Decision, bool) {
 	decision, err := m.inferenceMemoryDecision(provider)
 	if err != nil {
 		log.Printf("memplan: backend=%s source=%s requested=%s admitted=%s error=%v",
 			backend, decision.Source, decision.RequestedRequirements, decision.Requirements, err)
-		return
+		return decision, false
 	}
 	log.Printf("memplan: backend=%s source=%s available=%d admitted=batch:%d/context:%d advisory=%t %s",
 		backend, decision.Source, decision.AvailableBytes,
 		decision.Admitted.Batch, decision.Admitted.ContextTokens, decision.Advisory,
 		decision.Requirements)
+	return decision, true
+}
+
+// allocationReporter is implemented by backends that can report what they
+// actually allocated when constructed.
+type allocationReporter interface {
+	AllocatedBytes() (weights, host int64)
+}
+
+// logInferenceMemoryActual compares the pre-allocation estimate with the
+// bytes the backend actually holds. KV cache and scratch are per request and
+// therefore absent from this load-time comparison; the host copy is reported
+// separately because the estimate intentionally covers one weight store.
+func logInferenceMemoryActual(backend inferenceBackend, plan memplan.Decision, planned bool) {
+	if !planned {
+		return
+	}
+	reporter, ok := backend.(allocationReporter)
+	if !ok {
+		return
+	}
+	weights, host := reporter.AllocatedBytes()
+	comparison := memplan.Compare(plan.Requirements, memplan.ActualAllocation{
+		WeightsBytes: weights,
+		HostBytes:    host,
+	})
+	log.Printf("memplan: allocation backend=%s %s", backend.Name(), comparison)
 }

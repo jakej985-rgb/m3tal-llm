@@ -7,6 +7,8 @@ package lm
 func newInferenceBackend(m *Model) inferenceBackend {
 	// Read-only planning step: log the estimate before the CPU snapshot is
 	// cloned. Availability is unknown here, so the plan is advisory.
-	logInferenceMemoryPlan(m, "cpu", nil)
-	return newCPUInferenceBackend(m)
+	plan, planned := logInferenceMemoryPlan(m, "cpu", nil)
+	backend := newCPUInferenceBackend(m)
+	logInferenceMemoryActual(backend, plan, planned)
+	return backend
 }

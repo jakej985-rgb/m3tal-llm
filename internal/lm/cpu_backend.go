@@ -162,6 +162,29 @@ func (backend *cpuInferenceBackend) ForwardStepKV(tokenID int, pos int, cache *k
 	return forwardStepKV(backend.config, backend.vocab, backend.state, tokenID, pos, cache)
 }
 
+// AllocatedBytes reports the weight bytes this backend actually holds. The
+// CPU backend keeps a single fp32 copy, so there is no extra host copy.
+func (backend *cpuInferenceBackend) AllocatedBytes() (weights, host int64) {
+	return inferenceWeightsBytes(backend.state), 0
+}
+
+// inferenceWeightsBytes sums the fp32 storage of an inference snapshot.
+func inferenceWeightsBytes(state inferenceWeights) int64 {
+	bytes := int64(len(state.tokenEmb)) * 4
+	for _, block := range state.blocks {
+		layers := []inferenceLayer{
+			block.query, block.key, block.value, block.attnOut,
+			block.ffGate, block.ffUp, block.ffDown,
+		}
+		bytes += int64(len(block.normAttn)+len(block.normFF)) * 4
+		for _, layer := range layers {
+			bytes += int64(len(layer.weights)+len(layer.bias)) * 4
+		}
+	}
+	bytes += int64(len(state.output.weights)+len(state.output.bias)) * 4
+	return bytes
+}
+
 // swish computes the Swish/SiLU non-linearity: z * sigmoid(z).
 func swish(z float32) float32 {
 	sig := float32(1.0 / (1.0 + math.Exp(-float64(z))))

@@ -49,6 +49,38 @@ func TestInferenceMemoryConfigMapsModel(t *testing.T) {
 	}
 }
 
+// TestCPUAllocationMatchesPlannedWeights checks the estimate against the
+// weight clone the CPU backend actually holds at construction.
+func TestCPUAllocationMatchesPlannedWeights(t *testing.T) {
+	tok, err := TrainTokenizer([]string{"hello world hello there"}, 256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model, err := NewModel(Config{Context: 16, Width: 16, Layers: 2, Heads: 4}, tok, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := model.inferenceMemoryDecision(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := newCPUInferenceBackend(model).(*cpuInferenceBackend)
+	weights, host := backend.AllocatedBytes()
+	if weights != decision.Requirements.WeightsBytes {
+		t.Fatalf("allocated weights = %d, want estimate %d", weights, decision.Requirements.WeightsBytes)
+	}
+	if host != 0 {
+		t.Fatalf("host copy = %d, want 0 for the CPU backend", host)
+	}
+	comparison := memplan.Compare(decision.Requirements, memplan.ActualAllocation{
+		WeightsBytes: weights,
+		HostBytes:    host,
+	})
+	if comparison.WeightDeltaBytes != 0 {
+		t.Fatalf("weight delta = %d, want 0", comparison.WeightDeltaBytes)
+	}
+}
+
 // TestInferenceMemoryDecisionWithoutProviderIsAdvisory checks the CPU path:
 // without a device query the plan reports unknown availability and refuses
 // nothing, so wiring it in cannot change behavior yet.
